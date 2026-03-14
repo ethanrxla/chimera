@@ -20,6 +20,7 @@ def test_run_json_written_on_create(tmp_path: Path):
     payload = json.loads(run_file.read_text(encoding="utf-8"))
     assert payload["run_id"] == run_id
     assert payload["plan"]["tasks"]
+    assert payload["stats"]["exploit_chains"] == 0
 
 
 def test_run_json_updated_on_finish(tmp_path: Path):
@@ -36,6 +37,7 @@ def test_run_json_updated_on_finish(tmp_path: Path):
     assert record.data["status"] == "completed"
     assert record.data["ended_at"] is not None
     assert record.data["stats"]["findings_total"] == 1
+    assert record.data["stats"].get("exploit_chains", 0) == 0
 
 
 def test_run_json_updated_on_cancel(tmp_path: Path):

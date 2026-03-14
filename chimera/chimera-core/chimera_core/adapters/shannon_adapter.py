@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -123,6 +124,7 @@ class ShannonAdapter(AdapterBase):
 
             repro_guidance = item.get("repro_guidance") or evidence.get("repro_guidance") or item.get("poc")
             finding_id = stable_finding_id(title, target, self.id, str(signature) if signature else None)
+            inferred_type = _infer_finding_type(title, description, repro_guidance)
 
             findings.append(
                 Finding(
@@ -138,6 +140,14 @@ class ShannonAdapter(AdapterBase):
                     evidence_refs=list(evidence_refs) if evidence_refs else [],
                     repro_guidance=repro_guidance,
                     timestamps=datetime.now(timezone.utc),
+                    finding_type=inferred_type,
+                    asset={
+                        "host": _target_host(target),
+                        "endpoint": _target_path(target),
+                        "method": item.get("method"),
+                        "parameter": item.get("parameter"),
+                    },
+                    confidence=_confidence_from_severity(severity),
                 )
             )
         return findings
@@ -237,6 +247,8 @@ class ShannonAdapter(AdapterBase):
         return raw_output, formatted
 
     def _build_query(self, targets: List[str], opts: Dict[str, object]) -> str:
+        if opts.get("query"):
+            return str(opts["query"])
         vuln_types = opts.get("vuln_types") or ["injection", "xss", "ssrf", "broken_auth"]
         if isinstance(vuln_types, str):
             vuln_types = [vuln_types]
@@ -275,3 +287,43 @@ class ShannonAdapter(AdapterBase):
         base = dict(config.get("shannon", {}))
         base.update(self.options)
         return base
+
+
+def _infer_finding_type(title: str, description: str, repro_guidance: Optional[str]) -> str:
+    text = f"{title} {description} {repro_guidance or ''}".lower()
+    if "idor" in text or "bola" in text:
+        return "IDOR"
+    if "jwt" in text:
+        return "JWT"
+    if "rate limit" in text or "throttl" in text:
+        return "RATE_LIMIT"
+    if "xss" in text:
+        return "XSS"
+    if "auth" in text:
+        return "BROKEN_AUTH"
+    if re.search(r"\bsqli?\b|sql injection", text):
+        return "SQLI"
+    return "HYPOTHESIS"
+
+
+def _target_host(target: str) -> str:
+    if target.startswith("http://") or target.startswith("https://"):
+        from urllib.parse import urlparse
+        return urlparse(target).hostname or target
+    return target
+
+
+def _target_path(target: str) -> str:
+    if target.startswith("http://") or target.startswith("https://"):
+        from urllib.parse import urlparse
+        return urlparse(target).path or "/"
+    return "/"
+
+
+def _confidence_from_severity(severity: str) -> float:
+    return {
+        "critical": 0.97,
+        "high": 0.9,
+        "medium": 0.72,
+        "low": 0.55,
+    }.get(str(severity).lower(), 0.5)

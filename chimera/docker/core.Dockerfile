@@ -8,6 +8,7 @@ ARG ENABLE_DECEPTICON=0
 ARG ENABLE_SHANNON=0
 ARG ENABLE_ZYPHERON=0
 ARG ENABLE_ZYPHERON_ML=0
+ARG ENABLE_SUBFINDER=0
 
 RUN apt-get update && apt-get install -y \
     python3 python3-venv python3-pip python3-dev \
@@ -86,6 +87,13 @@ RUN if [ "$ENABLE_PLAYWRIGHT" = "1" ]; then \
         -r /tmp/requirements-shannon-playwright.txt \
       && playwright install --with-deps; \
     fi
+
+RUN if [ "$ENABLE_SUBFINDER" = "1" ]; then \
+      apt-get update && apt-get install -y golang-go && rm -rf /var/lib/apt/lists/* \
+      && go install -v github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest; \
+    fi
+
+ENV PATH="/root/go/bin:$PATH"
 
 RUN if [ "$ENABLE_SECURITY" = "1" ]; then \
       pip3 install --no-cache-dir -r /tmp/requirements-zypheron-security.txt; \

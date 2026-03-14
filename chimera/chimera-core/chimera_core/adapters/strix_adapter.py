@@ -2,6 +2,7 @@ import csv
 import json
 import sys
 from pathlib import Path
+from urllib.parse import urlparse
 from typing import Dict, List, Optional
 
 from chimera_core.adapters.base import AdapterBase
@@ -233,6 +234,36 @@ class StrixAdapter(AdapterBase):
                     tool_version="strix-1.0.0",
                     run_id=self.run_id,
                     scope_hash=self.scope_hash,
+                    finding_type=_infer_finding_type(title, description),
+                    asset={
+                        "host": urlparse(url).hostname or url,
+                        "endpoint": urlparse(url).path or "/",
+                        "method": entry.get("method"),
+                        "parameter": entry.get("parameter"),
+                    },
+                    confidence=_confidence_from_severity(severity),
                 )
             )
         return findings
+
+
+def _infer_finding_type(title: str, description: str) -> str:
+    text = f"{title} {description}".lower()
+    if "xss" in text:
+        return "XSS"
+    if "idor" in text or "bola" in text:
+        return "IDOR"
+    if "csrf" in text:
+        return "CSRF"
+    if "auth" in text:
+        return "BROKEN_AUTH"
+    return "WEB_FINDING"
+
+
+def _confidence_from_severity(severity: str) -> float:
+    return {
+        "critical": 0.95,
+        "high": 0.9,
+        "medium": 0.75,
+        "low": 0.55,
+    }.get(str(severity).lower(), 0.5)

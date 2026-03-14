@@ -64,6 +64,14 @@ def test_shannon_normalizes_fixture_output(tmp_path: Path) -> None:
         "run_id": "run-321",
         "scope_hash": "scope-321",
         "status": "new",
+        "finding_type": "SQLI",
+        "asset": {
+            "host": "example.com",
+            "endpoint": "/login",
+            "method": None,
+            "parameter": None,
+        },
+        "confidence": 0.9,
     }
 
 

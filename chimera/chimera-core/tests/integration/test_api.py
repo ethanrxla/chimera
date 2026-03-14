@@ -17,6 +17,113 @@ async def _make_client(app):
         yield client
 
 
+class FakeShannonResponse:
+    def __init__(self, payload):
+        self.payload = payload
+
+    def raise_for_status(self):
+        return None
+
+    def json(self):
+        return self.payload
+
+
+class FakeShannonHttpClient:
+    def post(self, url, json=None, headers=None):
+        return FakeShannonResponse({"task_id": "task-1", "status": "queued"})
+
+    def get(self, url, headers=None):
+        return FakeShannonResponse(
+            {
+                "task_id": "task-1",
+                "status": "completed",
+                "findings": [
+                    {
+                        "title": "JWT alg:none accepted",
+                        "description": "Token verification can be bypassed.",
+                        "severity": "high",
+                        "target": "https://api.example.com",
+                    }
+                ],
+            }
+        )
+
+    def close(self):
+        return None
+
+
+class FakePage:
+    def __init__(self) -> None:
+        self.url = ""
+        self._handlers = {}
+        self._content = "<script>node.innerHTML = location.search; window.addEventListener('message', handler)</script>"
+
+    def on(self, event: str, handler) -> None:
+        self._handlers[event] = handler
+
+    async def goto(self, url: str, timeout: int = 0):
+        self.url = url
+        return None
+
+    async def click(self, selector: str, timeout: int = 0):
+        return None
+
+    async def fill(self, selector: str, value: str, timeout: int = 0):
+        return None
+
+    async def wait_for_selector(self, selector: str, timeout: int = 0):
+        return None
+
+    async def wait_for_load_state(self, state: str, timeout: int = 0):
+        return None
+
+    async def evaluate(self, js_code: str):
+        if "document.scripts" in js_code:
+            return ["window.addEventListener('message', handler)"]
+        return {"ok": True}
+
+    async def eval_on_selector_all(self, selector: str, script: str):
+        return ["https://cdn.example.com/app.js"]
+
+    async def content(self) -> str:
+        return self._content
+
+    async def screenshot(self) -> bytes:
+        return b"fake"
+
+
+class FakeContext:
+    def __init__(self) -> None:
+        self.tracing = self
+
+    async def new_page(self):
+        return FakePage()
+
+    async def add_cookies(self, cookies):
+        return None
+
+    async def start(self, screenshots: bool = True, snapshots: bool = True):
+        return None
+
+    async def stop(self):
+        return None
+
+
+class FakeBrowser:
+    async def new_context(self):
+        return FakeContext()
+
+    async def close(self):
+        return None
+
+
+async def fake_browser_factory(headless: bool):
+    browser = FakeBrowser()
+    context = await browser.new_context()
+    page = await context.new_page()
+    return browser, context, page
+
+
 @pytest.mark.anyio
 async def test_api_run_and_reports(tmp_path: Path):
     app = create_app(testing=True)
@@ -357,3 +464,178 @@ async def test_api_health_fails_on_unwritable_artifacts(tmp_path: Path, monkeypa
         assert response.status_code == 503
         payload = response.json()
         assert payload["ok"] is False
+
+
+@pytest.mark.anyio
+async def test_browser_session_endpoints(tmp_path: Path):
+    app = create_app(testing=True)
+    app.state.artifacts_root = tmp_path / "artifacts"
+
+    async def fake_llm(prompt: str) -> str:
+        return '{"actions":[{"type":"navigate","url":"https://www.example.com/search"}],"context":{"source":"llm"}}'
+
+    app.state.browser_playwright_factory = fake_browser_factory
+    app.state.browser_llm_callable = fake_llm
+
+    async with _make_client(app) as client:
+        create_resp = await client.post("/v1/browser/sessions", json={"target": "https://www.example.com/search"})
+        assert create_resp.status_code == 201
+        session_id = create_resp.json()["session_id"]
+
+        analyze_resp = await client.post(f"/v1/browser/sessions/{session_id}/analyze", json={})
+        assert analyze_resp.status_code == 200
+        analyze_payload = analyze_resp.json()
+        assert analyze_payload["findings"]
+        assert analyze_payload["capture"]["dom_sinks"]
+
+        suggest_resp = await client.post(
+            f"/v1/browser/sessions/{session_id}/suggest-task",
+            json={"hypothesis": "Test reflected DOM XSS", "context": {"dom_snapshot": "<input name=q>"}},
+        )
+        assert suggest_resp.status_code == 200
+        assert suggest_resp.json()["task"]["actions"][0]["url"] == "https://www.example.com/search"
+
+        trace_resp = await client.post(
+            f"/v1/browser/sessions/{session_id}/trace-xss",
+            json={"parameter": "q", "payload": "<svg/onload=alert(1)>"},
+        )
+        assert trace_resp.status_code == 200
+        trace_payload = trace_resp.json()
+        assert trace_payload["trace"]["status"] == "confirmed"
+        assert trace_payload["findings"][0]["validation_status"] == "confirmed"
+
+        get_resp = await client.get(f"/v1/browser/sessions/{session_id}")
+        assert get_resp.status_code == 200
+        assert get_resp.json()["last_action"] == "trace-xss"
+
+        delete_resp = await client.delete(f"/v1/browser/sessions/{session_id}")
+        assert delete_resp.status_code == 200
+
+
+@pytest.mark.anyio
+async def test_browser_execute_endpoint_runs_task(tmp_path: Path):
+    app = create_app(testing=True)
+    app.state.artifacts_root = tmp_path / "artifacts"
+    app.state.browser_playwright_factory = fake_browser_factory
+
+    async with _make_client(app) as client:
+        create_resp = await client.post("/v1/browser/sessions", json={"target": "https://www.example.com/app"})
+        session_id = create_resp.json()["session_id"]
+        execute_resp = await client.post(
+            f"/v1/browser/sessions/{session_id}/execute",
+            json={"task": {"actions": [{"type": "navigate", "url": "https://www.example.com/app"}]}},
+        )
+        assert execute_resp.status_code == 200
+        payload = execute_resp.json()
+        assert payload["capture"]["url"] == "https://www.example.com/app"
+        assert payload["findings"][0]["finding_type"] == "DOM_XSS"
+
+
+@pytest.mark.anyio
+async def test_shannon_task_endpoints(tmp_path: Path):
+    app = create_app(testing=True)
+    app.state.artifacts_root = tmp_path / "artifacts"
+    app.state.shannon_http_client = FakeShannonHttpClient()
+
+    async with _make_client(app) as client:
+        create_resp = await client.post(
+            "/v1/shannon/tasks",
+            json={
+                "target": "https://api.example.com",
+                "query": "Assess JWT verification weaknesses.",
+                "base_url": "http://shannon.local",
+            },
+        )
+        assert create_resp.status_code == 202
+        task_id = create_resp.json()["task_id"]
+
+        for _ in range(50):
+            status_resp = await client.get(f"/v1/shannon/tasks/{task_id}")
+            assert status_resp.status_code == 200
+            payload = status_resp.json()
+            if payload["status"] == "completed":
+                break
+            await asyncio.sleep(0.01)
+
+        assert payload["status"] == "completed"
+        assert payload["result"]["findings"]
+        assert payload["result"]["findings"][0]["finding_type"] == "JWT"
+
+
+@pytest.mark.anyio
+async def test_parser_and_oracle_endpoints(tmp_path: Path):
+    app = create_app(testing=True)
+    app.state.artifacts_root = tmp_path / "artifacts"
+
+    async def fake_oracle(question: str, *, target=None, context=None):
+        return {"question": question, "target": target, "answer": "Try GraphQL batching.", "suggestions": [{"vector": "graphql_batching"}]}
+
+    app.state.shannon_oracle_callable = fake_oracle
+
+    async with _make_client(app) as client:
+        parse_resp = await client.post("/v1/parser/interpret", json={"text": "scan https://crapi.example.com with recon pipeline"})
+        assert parse_resp.status_code == 200
+        parsed = parse_resp.json()
+        assert parsed["kind"] == "command"
+        assert parsed["command"]["pipeline"] == "recon"
+        assert parsed["command"]["target"] == "https://crapi.example.com"
+
+        scope_resp = await client.post("/v1/parser/interpret", json={"text": "https://a.example.com\nhttps://b.example.com"})
+        assert scope_resp.status_code == 200
+        assert scope_resp.json()["kind"] == "scope"
+
+        oracle_resp = await client.post("/v1/shannon/oracle", json={"question": "What could go wrong with this GraphQL endpoint?", "target": "https://api.example.com/graphql"})
+        assert oracle_resp.status_code == 200
+        assert oracle_resp.json()["answer"] == "Try GraphQL batching."
+
+
+@pytest.mark.anyio
+async def test_chain_and_replay_endpoints(tmp_path: Path):
+    app = create_app(testing=True)
+    app.state.artifacts_root = tmp_path / "artifacts"
+    app.state.run_store = app.state.run_store.__class__(app.state.artifacts_root)
+    run_id = "run-chain"
+    run_dir = app.state.artifacts_root / run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+    app.state.run_store.create_run(
+        run_id,
+        scope_raw="allowlist: ['https://api.example.com']\n",
+        scope_normalized={"allowlist": ["https://api.example.com"], "denylist": []},
+        plan={"tasks": []},
+        options={"live": True},
+    )
+    finding_id = "chain-123"
+    findings = [
+        {
+            "finding_id": finding_id,
+            "title": "Exploit chain: IDOR plus JWT weakness enables account takeover",
+            "severity": "critical",
+            "validation_status": "confirmed",
+            "replay_steps": [{"step": 1, "action": "GET /api/users/42", "expected_result": "Other user's data is returned."}],
+            "proof_artifacts": [{"type": "http", "ref": "/artifacts/request-1.json"}],
+            "chain_parent_ids": ["f1", "f2"],
+        }
+    ]
+    (run_dir / "findings.json").write_text(json.dumps(findings), encoding="utf-8")
+    (run_dir / "chains.json").write_text(json.dumps(findings), encoding="utf-8")
+    (run_dir / "chain_graphs.json").write_text(
+        json.dumps([{"finding_id": finding_id, "ascii": "[CRITICAL] chain", "title": findings[0]["title"], "severity": "critical"}]),
+        encoding="utf-8",
+    )
+    poc_dir = run_dir / "poc_bundles"
+    poc_dir.mkdir(parents=True, exist_ok=True)
+    (poc_dir / "chain.json").write_text(json.dumps({"finding": findings[0], "replay_manifest": findings[0]["replay_steps"]}), encoding="utf-8")
+
+    async with _make_client(app) as client:
+        chains_resp = await client.get(f"/v1/runs/{run_id}/chains")
+        assert chains_resp.status_code == 200
+        assert chains_resp.json()[0]["finding_id"] == finding_id
+
+        chain_detail_resp = await client.get(f"/v1/runs/{run_id}/chains/{finding_id}")
+        assert chain_detail_resp.status_code == 200
+        assert chain_detail_resp.json()["chain"]["finding_id"] == finding_id
+        assert chain_detail_resp.json()["graph"]["ascii"] == "[CRITICAL] chain"
+
+        replay_resp = await client.get(f"/v1/runs/{run_id}/replays/{finding_id}")
+        assert replay_resp.status_code == 200
+        assert replay_resp.json()["replay_steps"][0]["action"] == "GET /api/users/42"

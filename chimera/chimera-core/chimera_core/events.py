@@ -1,6 +1,6 @@
 ﻿from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import datetime, UTC
 import json
 import os
@@ -12,6 +12,37 @@ from uuid import uuid4
 @dataclass(frozen=True)
 class EventCursor:
     offset: int
+
+
+@dataclass(frozen=True)
+class FindingValidated:
+    finding_id: str
+    validation_status: str
+    confidence: float
+    validator_name: str
+
+
+@dataclass(frozen=True)
+class ChainDiscovered:
+    root_finding_id: str
+    chain_ids: List[str]
+    combined_severity: str
+    impact_summary: str
+
+
+@dataclass(frozen=True)
+class FalsePositiveRejected:
+    finding_id: str
+    reason: str
+    validator_name: str
+
+
+def event_payload(event: Any) -> Dict[str, Any]:
+    if hasattr(event, "__dataclass_fields__"):
+        return asdict(event)
+    if isinstance(event, dict):
+        return event
+    raise TypeError(f"Unsupported event payload type: {type(event)!r}")
 
 
 class EventStore:

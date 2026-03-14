@@ -1,0 +1,28 @@
+# Chimera CLI
+
+`chimera-cli` is the Rust control surface for the Chimera backend.
+
+It is scope-first:
+- `chimera-cli --target https://crapi.example.com` generates a valid scope manifest automatically
+- `chimera-cli scan --scope-file scope.yaml` uses an existing scope file
+- the last target, scope file, pipeline, and run id are remembered in local CLI state
+
+Default API base:
+
+```text
+http://127.0.0.1:8000/v1
+```
+
+Examples:
+
+```bash
+cargo run -- --target https://crapi.example.com
+cargo run -- scan --target https://juice-shop.local --pipeline recon
+cargo run -- status
+cargo run -- viz --run <run_id>
+cargo run -- chain --run <run_id>
+cargo run -- exploit --run <run_id> <chain_id> --replay
+```
+
+The CLI is a frontend over the existing Chimera API and artifacts. It does not invent its own protocol.
+

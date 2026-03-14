@@ -25,5 +25,9 @@ def test_orchestrator_fixture_run(tmp_path: Path):
     assert run_dirs, "Expected a run artifacts directory"
     run_dir = run_dirs[0]
     assert (run_dir / "findings.json").exists()
+    assert (run_dir / "chains.json").exists()
+    assert (run_dir / "chain_graphs.json").exists()
+    assert (run_dir / "rejected_findings.json").exists()
+    assert (run_dir / "poc_bundles").exists()
     assert (run_dir / "report.md").exists()
     assert (run_dir / "summary.json").exists()

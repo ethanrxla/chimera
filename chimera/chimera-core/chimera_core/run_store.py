@@ -23,11 +23,18 @@ def _plan_snapshot(plan: Any) -> Dict[str, Any]:
         tasks.append({
             "task_id": task.task_id,
             "adapter": task.tool,
+            "stage": getattr(task, "stage", "discover"),
+            "capability": getattr(task, "capability", task.tool),
             "target": task.target,
             "depends_on": sorted(task.dependencies),
             "options": task.options,
         })
-    return {"tasks": tasks}
+    snapshot = {"tasks": tasks}
+    if hasattr(plan, "stages"):
+        snapshot["stages"] = list(plan.stages)
+    if hasattr(plan, "metadata"):
+        snapshot["metadata"] = dict(plan.metadata)
+    return snapshot
 
 
 @dataclass
@@ -75,6 +82,7 @@ class RunStore:
                 "tasks_total": tasks_total,
                 "findings_total": 0,
                 "duplicates": 0,
+                "exploit_chains": 0,
             },
         }
         self._run_file(run_id).write_text(json.dumps(data, indent=2), encoding="utf-8")

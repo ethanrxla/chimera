@@ -16,7 +16,7 @@ def _get_default_config() -> Dict[str, Any]:
         allowed_binaries = [b.strip() for b in allowed_binaries_env.split(",") if b.strip()]
     else:
         # Default safe binaries
-        allowed_binaries = ["python", "python3", "autoswagger", "strix", "curl", "httpx"]
+        allowed_binaries = ["python", "python3", "autoswagger", "strix", "curl", "httpx", "subfinder", "nc", "netcat"]
 
     # Parse allow_destructive flag
     allow_destructive = os.getenv("CHIMERA_ALLOW_DESTRUCTIVE", "false").lower() in {"true", "1", "yes"}

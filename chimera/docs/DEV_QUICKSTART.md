@@ -1,25 +1,65 @@
-﻿# Dev Quickstart (WSL/Linux)
+# Dev Quickstart
 
 ## Prereqs
-- Python 3.9+
-- Tkinter (`python3-tk` package on Debian/Ubuntu)
 
-## Setup
+- Python 3.11+
+- Rust toolchain for the Rust CLI
+- Playwright-capable environment if you want browser automation
+- Optional: Supabase credentials in env for DB sync
+
+## Core Setup
+
 ```bash
+cd /home/theif/projects/kali-docker/chimera/chimera-core
 python3 -m venv .venv
-source .venv/bin/activate
+. .venv/bin/activate
+pip install -r requirements.txt
 ```
 
-## Run the core CLI
+## Run The Python CLI
+
 ```bash
-PYTHONPATH=chimera-core python3 -m chimera_core --help
+cd /home/theif/projects/kali-docker/chimera
+./scripts/run_core.sh --help
 ```
 
-## Run the UI shell
+## Run The API
+
 ```bash
-python3 chimera-ui/launcher.py
+cd /home/theif/projects/kali-docker/chimera/chimera-core
+. .venv/bin/activate
+uvicorn chimera_core.api.app:create_app --factory --host 127.0.0.1 --port 8000
 ```
+
+## Run The Rust CLI
+
+```bash
+cd /home/theif/projects/kali-docker/chimera/chimera-cli
+. "$HOME/.cargo/env"
+cargo run -- --help
+```
+
+## Useful Checks
+
+```bash
+cd /home/theif/projects/kali-docker/chimera/chimera-core
+.venv/bin/python -m pytest tests/unit -q
+.venv/bin/python -m pytest tests/integration/test_api.py -q
+```
+
+## Current API Highlights
+
+- `/v1/runs`
+- `/v1/status`
+- `/v1/browser/sessions`
+- `/v1/parser/interpret`
+- `/v1/shannon/oracle`
+- `/v1/shannon/tasks`
+- `/v1/runs/{run_id}/chains`
+- `/v1/runs/{run_id}/replays/{finding_id}`
 
 ## Notes
-- Config file defaults to `~/.chimera/config.json` and can be created via `python3 -m chimera_core config --init`.
-- The UI is a shell only; real integrations will land in later phases.
+
+- Config defaults to `~/.chimera/config.json`.
+- Artifacts default to `chimera/chimera-core/artifacts` unless overridden.
+- LLM use is for hypothesis generation and narrative support, not core validation.

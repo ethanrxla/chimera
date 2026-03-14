@@ -33,6 +33,16 @@
       "type": "python",
       "entrypoint": ["python", "decepticon.py"],
       "workdir": "/app/tools/decepticon"
+    },
+    "subfinder": {
+      "enabled": true,
+      "type": "binary",
+      "binary": "/usr/bin/subfinder"
+    },
+    "browser": {
+      "enabled": true,
+      "type": "python",
+      "entrypoint": ["python", "-m", "playwright"]
     }
   }
 }

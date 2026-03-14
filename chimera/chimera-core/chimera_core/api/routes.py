@@ -2,6 +2,7 @@ import json
 import threading
 import asyncio
 import hashlib
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, Optional
@@ -16,6 +17,13 @@ from chimera_core.planner import generate_plan
 from chimera_core.scope import normalize_scope
 from chimera_core.modules.safety.policy import SafetyPolicy
 from chimera_core.runtime import Runtime
+from chimera_core.event_store import EventStore
+from chimera_core.adapters.browser_adapter import BrowserAdapter
+from chimera_core.adapters.shannon_adapter import ShannonAdapter
+from chimera_core.capabilities.browser.browser_task import BrowserTask
+from chimera_core.api.browser_sessions import PersistentBrowserSession
+from chimera_core.api.input_parser import interpret_input
+from chimera_core.api.oracle import heuristic_oracle
 from chimera_core.modules.recon_gatherers.orchestrator import (
     run_zypheron_and_persist,
     run_vibepentester_and_persist,
@@ -466,6 +474,78 @@ def _clamp_int(value: Optional[object], minimum: int, maximum: int, default: int
     return max(minimum, min(maximum, number))
 
 
+def _default_scope_manifest(target: str) -> Dict[str, object]:
+    return {"allowlist": [target], "denylist": []}
+
+
+def _service_runtime(
+    request: Request,
+    *,
+    scope_manifest: Dict[str, object],
+    run_id: str,
+    mode: str = "live",
+) -> Runtime:
+    scope_graph, scope_policy = normalize_scope(scope_manifest)
+    artifacts_root = Path(request.app.state.artifacts_root)
+    events_path = artifacts_root / run_id / "events.jsonl"
+    events_path.parent.mkdir(parents=True, exist_ok=True)
+    event_store = EventStore(events_path)
+    safety_policy = SafetyPolicy(
+        enforce_scope=True,
+        allow_external_execution=(mode == "live"),
+        require_live_confirm=False,
+        max_workers=2,
+        rps=10,
+        timeout_s=120,
+    )
+    return Runtime(
+        scope_graph=scope_graph,
+        scope_policy=scope_policy,
+        event_store=event_store,
+        artifacts_root=artifacts_root,
+        run_id=run_id,
+        safety_policy=safety_policy,
+        mode=mode,
+    )
+
+
+def _browser_sessions(request: Request) -> Dict[str, Dict[str, object]]:
+    return request.app.state.browser_sessions
+
+
+def _shannon_tasks(request: Request) -> Dict[str, Dict[str, object]]:
+    return request.app.state.shannon_tasks
+
+
+def _serialize_browser_task(task) -> Dict[str, object]:
+    if hasattr(task, "model_dump"):
+        return task.model_dump()
+    if hasattr(task, "dict"):
+        return task.dict()
+    return dict(task)
+
+
+def _sanitize_browser_session(session: Dict[str, object]) -> Dict[str, object]:
+    return {
+        "session_id": session.get("session_id"),
+        "run_id": session.get("run_id"),
+        "target": session.get("target"),
+        "scope_manifest": session.get("scope_manifest"),
+        "headless": session.get("headless", True),
+        "created_at": session.get("created_at"),
+        "updated_at": session.get("updated_at"),
+        "last_action": session.get("last_action"),
+        "artifacts_dir": session.get("artifacts_dir"),
+    }
+
+
+def _load_json_artifact(artifacts_dir: Path, filename: str):
+    path = artifacts_dir / filename
+    if not path.exists():
+        return None
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
 @router.post("/runs/plan")
 async def plan_run(payload: Dict[str, object]):
     scope_text = payload.get("scope_text")
@@ -562,6 +642,272 @@ async def health(request: Request):
 
     status = 200 if ok else 503
     return JSONResponse({"ok": ok, "checks": checks}, status_code=status)
+
+
+@router.post("/parser/interpret")
+async def parse_operator_input(payload: Dict[str, object]):
+    text = str(payload.get("text") or "").strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="text is required")
+    return JSONResponse(interpret_input(text))
+
+
+@router.post("/shannon/oracle")
+async def shannon_oracle(request: Request, payload: Dict[str, object]):
+    question = str(payload.get("question") or "").strip()
+    if not question:
+        raise HTTPException(status_code=400, detail="question is required")
+    target = payload.get("target")
+    context = dict(payload.get("context") or {})
+    oracle_callable = getattr(request.app.state, "shannon_oracle_callable", None)
+    if oracle_callable is not None:
+        result = await oracle_callable(question, target=target, context=context)
+        return JSONResponse(result)
+    response = heuristic_oracle(question, target=str(target) if target else None, context=context)
+    if payload.get("request_browser_task") and getattr(request.app.state, "browser_llm_callable", None) is not None:
+        adapter = BrowserAdapter(
+            runtime=_service_runtime(
+                request,
+                scope_manifest=_default_scope_manifest(str(target or context.get("target") or "example.com")),
+                run_id=f"oracle-{uuid.uuid4().hex[:12]}",
+            ),
+            options={"llm_callable": request.app.state.browser_llm_callable},
+            run_id=f"oracle-{uuid.uuid4().hex[:12]}",
+            task_id=f"oracle-{uuid.uuid4().hex[:8]}",
+            scope_hash="oracle",
+            artifacts_root=Path(request.app.state.artifacts_root),
+        )
+        task = await adapter.suggest_task(context, question)
+        response["suggested_browser_task"] = _serialize_browser_task(task)
+    return JSONResponse(response)
+
+
+@router.post("/browser/sessions")
+async def create_browser_session(request: Request, payload: Dict[str, object]):
+    target = str(payload.get("target") or "").strip()
+    if not target:
+        raise HTTPException(status_code=400, detail="target is required")
+    scope_text = payload.get("scope_text")
+    scope_manifest = _load_scope(scope_text) if scope_text else _default_scope_manifest(target)
+    session_id = str(uuid.uuid4())
+    run_id = str(payload.get("run_id") or f"browser-session-{session_id[:12]}")
+    session = {
+        "session_id": session_id,
+        "run_id": run_id,
+        "target": target,
+        "scope_manifest": scope_manifest,
+        "headless": bool(payload.get("headless", True)),
+        "auth_cookies": dict(payload.get("auth_cookies") or {}),
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+        "last_action": "created",
+        "artifacts_dir": str(Path(request.app.state.artifacts_root) / run_id / "browser"),
+        "backend": PersistentBrowserSession(
+            target=target,
+            headless=bool(payload.get("headless", True)),
+            auth_cookies=dict(payload.get("auth_cookies") or {}),
+            playwright_factory=getattr(request.app.state, "browser_playwright_factory", None),
+        ),
+    }
+    _browser_sessions(request)[session_id] = session
+    return JSONResponse(_sanitize_browser_session(session), status_code=201)
+
+
+@router.get("/browser/sessions/{session_id}")
+async def get_browser_session(request: Request, session_id: str):
+    session = _browser_sessions(request).get(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Browser session not found")
+    return JSONResponse(_sanitize_browser_session(session))
+
+
+@router.delete("/browser/sessions/{session_id}")
+async def delete_browser_session(request: Request, session_id: str):
+    session = _browser_sessions(request).pop(session_id, None)
+    if not session:
+        raise HTTPException(status_code=404, detail="Browser session not found")
+    backend = session.get("backend")
+    if backend is not None:
+        await backend.close()
+    return JSONResponse({"session_id": session_id, "status": "deleted"})
+
+
+def _browser_adapter_for_session(request: Request, session: Dict[str, object], *, task_id: str, options: Optional[Dict[str, object]] = None) -> BrowserAdapter:
+    runtime = _service_runtime(request, scope_manifest=session["scope_manifest"], run_id=str(session["run_id"]))
+    merged_options = dict(options or {})
+    merged_options.setdefault("headless", session.get("headless", True))
+    merged_options.setdefault("auth_cookies", session.get("auth_cookies") or {})
+    if getattr(request.app.state, "browser_playwright_factory", None) is not None:
+        merged_options.setdefault("playwright_factory", request.app.state.browser_playwright_factory)
+    if getattr(request.app.state, "browser_capture_factory", None) is not None:
+        merged_options.setdefault("browser_factory", request.app.state.browser_capture_factory)
+    if getattr(request.app.state, "browser_llm_callable", None) is not None:
+        merged_options.setdefault("llm_callable", request.app.state.browser_llm_callable)
+    return BrowserAdapter(
+        runtime=runtime,
+        options=merged_options,
+        run_id=str(session["run_id"]),
+        task_id=task_id,
+        scope_hash=hashlib.sha256(json.dumps(session["scope_manifest"], sort_keys=True).encode()).hexdigest(),
+        artifacts_root=Path(request.app.state.artifacts_root),
+    )
+
+
+@router.post("/browser/sessions/{session_id}/analyze")
+async def browser_session_analyze(request: Request, session_id: str, payload: Dict[str, object]):
+    session = _browser_sessions(request).get(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Browser session not found")
+    target = str(payload.get("url") or session["target"])
+    adapter = _browser_adapter_for_session(request, session, task_id=f"analyze-{uuid.uuid4().hex[:8]}")
+    backend = session.get("backend")
+    capture = await backend.analyze(target) if backend is not None else await adapter.analyze_page(target, auth_cookies=session.get("auth_cookies"))
+    findings = adapter.normalize(capture)
+    session["updated_at"] = datetime.now(timezone.utc).isoformat()
+    session["last_action"] = "analyze"
+    return JSONResponse({"session": _sanitize_browser_session(session), "capture": capture, "findings": [item.to_dict() for item in findings]})
+
+
+@router.post("/browser/sessions/{session_id}/suggest-task")
+async def browser_session_suggest_task(request: Request, session_id: str, payload: Dict[str, object]):
+    session = _browser_sessions(request).get(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Browser session not found")
+    hypothesis = str(payload.get("hypothesis") or "").strip()
+    if not hypothesis:
+        raise HTTPException(status_code=400, detail="hypothesis is required")
+    context = dict(payload.get("context") or {})
+    adapter = _browser_adapter_for_session(request, session, task_id=f"suggest-{uuid.uuid4().hex[:8]}")
+    task = await adapter.suggest_task(context, hypothesis)
+    session["updated_at"] = datetime.now(timezone.utc).isoformat()
+    session["last_action"] = "suggest-task"
+    return JSONResponse({"session": _sanitize_browser_session(session), "task": _serialize_browser_task(task)})
+
+
+@router.post("/browser/sessions/{session_id}/execute")
+async def browser_session_execute(request: Request, session_id: str, payload: Dict[str, object]):
+    session = _browser_sessions(request).get(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Browser session not found")
+    task_payload = payload.get("task")
+    if not isinstance(task_payload, dict):
+        raise HTTPException(status_code=400, detail="task object is required")
+    target = str(payload.get("url") or session["target"])
+    adapter = _browser_adapter_for_session(request, session, task_id=f"execute-{uuid.uuid4().hex[:8]}")
+    task = BrowserTask(**task_payload)
+    backend = session.get("backend")
+    capture = await backend.execute(task, url=target) if backend is not None else await adapter.analyze_page(target, auth_cookies=session.get("auth_cookies"))
+    findings = adapter.normalize(capture)
+    session["updated_at"] = datetime.now(timezone.utc).isoformat()
+    session["last_action"] = "execute"
+    return JSONResponse({"session": _sanitize_browser_session(session), "capture": capture, "findings": [item.to_dict() for item in findings]})
+
+
+@router.post("/browser/sessions/{session_id}/trace-xss")
+async def browser_session_trace_xss(request: Request, session_id: str, payload: Dict[str, object]):
+    session = _browser_sessions(request).get(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Browser session not found")
+    target = str(payload.get("url") or session["target"])
+    parameter = str(payload.get("parameter") or "q")
+    payload_value = str(payload.get("payload") or "<svg/onload=alert(1)>")
+    adapter = _browser_adapter_for_session(
+        request,
+        session,
+        task_id=f"trace-xss-{uuid.uuid4().hex[:8]}",
+        options={"parameter": parameter},
+    )
+    backend = session.get("backend")
+    trace = await backend.trace_xss(url=target, parameter=parameter, payload=payload_value) if backend is not None else await adapter.trace_xss_sink(target, parameter, payload_value)
+    findings = adapter._findings_from_trace_result(target, trace)
+    session["updated_at"] = datetime.now(timezone.utc).isoformat()
+    session["last_action"] = "trace-xss"
+    return JSONResponse({"session": _sanitize_browser_session(session), "trace": trace, "findings": [item.to_dict() for item in findings]})
+
+
+@router.post("/shannon/tasks")
+async def create_shannon_task(request: Request, payload: Dict[str, object]):
+    targets = payload.get("targets") or []
+    if isinstance(targets, str):
+        targets = [targets]
+    if not targets:
+        target = str(payload.get("target") or "").strip()
+        if target:
+            targets = [target]
+    if not targets:
+        raise HTTPException(status_code=400, detail="target or targets is required")
+
+    query = str(payload.get("query") or "").strip()
+    if not query:
+        raise HTTPException(status_code=400, detail="query is required")
+
+    scope_text = payload.get("scope_text")
+    scope_manifest = _load_scope(scope_text) if scope_text else {"allowlist": list(targets), "denylist": []}
+    task_id = str(uuid.uuid4())
+    run_id = str(payload.get("run_id") or f"shannon-task-{task_id[:12]}")
+    record = {
+        "task_id": task_id,
+        "run_id": run_id,
+        "status": "queued",
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+        "query": query,
+        "targets": list(targets),
+        "error": None,
+        "result": None,
+    }
+    _shannon_tasks(request)[task_id] = record
+
+    def _run_task() -> None:
+        record["status"] = "running"
+        record["updated_at"] = datetime.now(timezone.utc).isoformat()
+        try:
+            runtime = _service_runtime(request, scope_manifest=scope_manifest, run_id=run_id)
+            options = {
+                "live": True,
+                "driver": str(payload.get("driver") or "http"),
+                "query": query,
+                "base_url": payload.get("base_url"),
+                "api_key": payload.get("api_key"),
+                "session_id": payload.get("session_id") or f"chimera-api-{task_id}",
+                "http_client": getattr(request.app.state, "shannon_http_client", None),
+                "poll_interval_s": payload.get("poll_interval_s", 0.01 if getattr(request.app.state, "testing", False) else 2),
+                "timeout_s": payload.get("timeout_s", 120),
+            }
+            options = {key: value for key, value in options.items() if value is not None}
+            adapter = ShannonAdapter(
+                runtime=runtime,
+                options=options,
+                run_id=run_id,
+                task_id=task_id,
+                scope_hash=hashlib.sha256(json.dumps(scope_manifest, sort_keys=True).encode()).hexdigest(),
+                artifacts_root=Path(request.app.state.artifacts_root),
+            )
+            result = adapter.run(list(targets))
+            record["status"] = "completed"
+            record["result"] = {
+                "findings": [item.to_dict() for item in result.get("findings", [])],
+                "artifacts": result.get("artifacts", []),
+                "command": result.get("command"),
+            }
+        except Exception as exc:
+            record["status"] = "failed"
+            record["error"] = str(exc)
+        finally:
+            record["updated_at"] = datetime.now(timezone.utc).isoformat()
+
+    thread = threading.Thread(target=_run_task, daemon=True)
+    thread.start()
+
+    return JSONResponse({"task_id": task_id, "run_id": run_id, "status": "queued"}, status_code=202)
+
+
+@router.get("/shannon/tasks/{task_id}")
+async def get_shannon_task(request: Request, task_id: str):
+    task = _shannon_tasks(request).get(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Shannon task not found")
+    return JSONResponse(task)
 
 
 @router.post("/runs")
@@ -800,6 +1146,81 @@ async def get_finding_detail(request: Request, run_id: str, stable_id: str):
         "raw": raw,
     }
     return JSONResponse(detail)
+
+
+@router.get("/runs/{run_id}/chains")
+async def get_chains(request: Request, run_id: str):
+    artifacts_dir = _resolve_artifacts_dir(request, run_id)
+    if not artifacts_dir:
+        raise HTTPException(status_code=404, detail="Artifacts not ready")
+    chains = _load_json_artifact(Path(artifacts_dir), "chains.json")
+    if chains is None:
+        raise HTTPException(status_code=404, detail="Chains not found")
+    graphs = _load_json_artifact(Path(artifacts_dir), "chain_graphs.json") or []
+    graphs_by_id = {item.get("finding_id"): item for item in graphs if item.get("finding_id")}
+    summaries = []
+    for chain in chains:
+        summaries.append(
+            {
+                "finding_id": chain.get("finding_id"),
+                "title": chain.get("title"),
+                "severity": chain.get("severity"),
+                "confidence": _confidence_to_float(chain.get("confidence")),
+                "chain_parent_ids": chain.get("chain_parent_ids", []),
+                "graph_ascii": (graphs_by_id.get(chain.get("finding_id")) or {}).get("ascii"),
+            }
+        )
+    return JSONResponse(summaries)
+
+
+@router.get("/runs/{run_id}/chains/{chain_id}")
+async def get_chain_detail(request: Request, run_id: str, chain_id: str):
+    artifacts_dir = _resolve_artifacts_dir(request, run_id)
+    if not artifacts_dir:
+        raise HTTPException(status_code=404, detail="Artifacts not ready")
+    chains = _load_json_artifact(Path(artifacts_dir), "chains.json") or []
+    graphs = _load_json_artifact(Path(artifacts_dir), "chain_graphs.json") or []
+    graph_map = {item.get("finding_id"): item for item in graphs if item.get("finding_id")}
+    selected = next((item for item in chains if item.get("finding_id") == chain_id), None)
+    if selected is None:
+        raise HTTPException(status_code=404, detail="Chain not found")
+    bundle = None
+    bundles_dir = Path(artifacts_dir) / "poc_bundles"
+    if bundles_dir.exists():
+        for path in bundles_dir.glob("*.json"):
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            finding = payload.get("finding") or {}
+            if finding.get("finding_id") == chain_id:
+                bundle = payload
+                break
+    return JSONResponse(
+        {
+            "chain": selected,
+            "graph": graph_map.get(chain_id),
+            "poc_bundle": bundle,
+        }
+    )
+
+
+@router.get("/runs/{run_id}/replays/{finding_id}")
+async def get_replay_manifest(request: Request, run_id: str, finding_id: str):
+    artifacts_dir = _resolve_artifacts_dir(request, run_id)
+    if not artifacts_dir:
+        raise HTTPException(status_code=404, detail="Artifacts not ready")
+    findings = _load_json_artifact(Path(artifacts_dir), "findings.json") or []
+    selected = next((item for item in findings if item.get("finding_id") == finding_id), None)
+    if selected is None:
+        raise HTTPException(status_code=404, detail="Replay manifest not found")
+    return JSONResponse(
+        {
+            "finding_id": finding_id,
+            "title": selected.get("title"),
+            "validation_status": selected.get("validation_status"),
+            "replay_steps": selected.get("replay_steps", []),
+            "proof_artifacts": selected.get("proof_artifacts", []),
+            "chain_parent_ids": selected.get("chain_parent_ids", []),
+        }
+    )
 
 
 @router.get("/runs/{run_id}/artifacts")

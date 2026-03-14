@@ -119,7 +119,16 @@ class Orchestrator:
             job.status = JobStatus.PLANNING_TESTS
             print(f"[Orchestrator] Job {job_id} status: {job.status.value}")
             plan = generate_plan(scope_graph, scope_policy, None)
-            self._emit_event(event_sink, "plan_created", {"job_id": job_id, "task_count": len(plan.tasks)})
+            self._emit_event(
+                event_sink,
+                "plan_created",
+                {
+                    "job_id": job_id,
+                    "task_count": len(plan.tasks),
+                    "stages": getattr(plan, "stages", []),
+                    "metadata": getattr(plan, "metadata", {}),
+                },
+            )
 
             # 3. Run setup
             run_manager = RunManager(self.artifacts_root)
@@ -277,11 +286,15 @@ class Orchestrator:
                     "tasks_total": len(plan.tasks),
                     "findings_total": len(deduped),
                     "duplicates": duplicates,
+                    "exploit_chains": len([finding for finding in deduped if finding.finding_type == "EXPLOIT_CHAIN"]),
                 },
             )
             if local_sink.report_artifacts:
                 artifacts = [
                     local_sink.report_artifacts.findings_path,
+                    local_sink.report_artifacts.chains_path,
+                    local_sink.report_artifacts.chain_graphs_path,
+                    local_sink.report_artifacts.rejected_findings_path,
                     local_sink.report_artifacts.report_path,
                     local_sink.report_artifacts.summary_path,
                 ]
@@ -294,6 +307,18 @@ class Orchestrator:
                                 "job_id": job_id,
                                 "path": str(artifact),
                                 "artifact_type": artifact.name,
+                            },
+                        }
+                    )
+                for artifact in local_sink.report_artifacts.poc_bundles_dir.glob("*.json"):
+                    sink.emit_event(
+                        {
+                            "event_type": "artifact_saved",
+                            "payload": {
+                                "run_id": run.run_id,
+                                "job_id": job_id,
+                                "path": str(artifact),
+                                "artifact_type": "poc_bundle",
                             },
                         }
                     )

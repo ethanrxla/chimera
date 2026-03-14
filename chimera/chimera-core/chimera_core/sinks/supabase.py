@@ -82,7 +82,18 @@ class SupabaseSink(EventSink):
             "evidence": {
                 "evidence_refs": finding.evidence_refs,
                 "repro_guidance": finding.repro_guidance,
+                "proof_artifacts": finding.proof_artifacts,
+                "replay_steps": finding.replay_steps,
             },
+            "validation_status": finding.validation_status,
+            "validation_reason": finding.validation_reason,
+            "confidence": finding.confidence,
+            "finding_type": finding.finding_type,
+            "asset": finding.asset,
+            "auth_context": finding.auth_context,
+            "chain_parent_ids": finding.chain_parent_ids,
+            "impact_path": finding.impact_path,
+            "sink": finding.sink,
             "hash": finding.finding_id,
         }
 

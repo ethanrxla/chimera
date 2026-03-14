@@ -86,6 +86,14 @@ def test_autoswagger_normalizes_fixture_output(tmp_path):
         "run_id": "run-123",
         "scope_hash": "scope-123",
         "status": "new",
+        "finding_type": "AUTH_EXPOSURE",
+        "asset": {
+            "host": "api.example.com",
+            "endpoint": "/users",
+            "method": "GET",
+            "parameter": None,
+        },
+        "confidence": 0.55,
     }
 
 

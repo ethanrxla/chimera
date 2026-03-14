@@ -1,6 +1,7 @@
 import json
 import sys
 from pathlib import Path
+from urllib.parse import urlparse
 from typing import Dict, List, Optional
 
 from chimera_core.adapters.base import AdapterBase
@@ -194,6 +195,14 @@ class AutoswaggerAdapter(AdapterBase):
                     tool_version="0.1.0",
                     run_id=self.run_id,
                     scope_hash=self.scope_hash,
+                    finding_type="AUTH_EXPOSURE" if pii or secrets else "DATA_EXPOSURE",
+                    asset={
+                        "host": urlparse(url).hostname or url,
+                        "endpoint": urlparse(url).path or "/",
+                        "method": method,
+                        "parameter": None,
+                    },
+                    confidence=0.7 if secrets else 0.55,
                 )
             )
         return findings

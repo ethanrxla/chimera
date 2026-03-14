@@ -33,6 +33,7 @@ class Finding:
     reproduction: Optional[str] = None
     tags: List[str] = field(default_factory=list)
     raw_tool_fields: Dict[str, Any] = field(default_factory=dict)
+    chain_metadata: Optional[Dict[str, Any]] = None
 
 @dataclass
 class Artifact:

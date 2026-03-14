@@ -26,6 +26,13 @@ def create_app(testing: bool = False) -> FastAPI:
         "autoswagger": str(fixtures_root / "autoswagger" / "output.json"),
         "strix": str(fixtures_root / "strix" / "output.json"),
     }
+    app.state.browser_sessions = {}
+    app.state.shannon_tasks = {}
+    app.state.browser_playwright_factory = None
+    app.state.browser_capture_factory = None
+    app.state.browser_llm_callable = None
+    app.state.shannon_http_client = None
+    app.state.shannon_oracle_callable = None
 
     app.include_router(router, prefix="/v1")
     app.include_router(recon_router, prefix="/v1")

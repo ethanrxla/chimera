@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import List, Optional
 
 from .config import get_config_path, load_config, write_default_config
+from .db_sync import sync_run_directory
 from .config_manager import (
     get_unified_config_path,
     import_registry,
@@ -59,6 +60,10 @@ def build_parser() -> argparse.ArgumentParser:
     findings_cmd.add_argument("job_id", help="ID of the job to get findings for")
 
     smoke_cmd = subparsers.add_parser("smoke-test", help="Run a smoke test to validate the environment")
+
+    sync_cmd = subparsers.add_parser("sync-db", help="Sync an existing run directory into Supabase")
+    sync_cmd.add_argument("--run-id", required=True, help="Run ID under artifacts/")
+    sync_cmd.add_argument("--artifacts-root", default="artifacts", help="Artifacts root directory")
 
     return parser
 
@@ -225,6 +230,21 @@ def main(argv: Optional[List[str]] = None) -> int:
             return 1
 
         print("\nSmoke test passed!")
+        return 0
+
+    if args.command == "sync-db":
+        config = load_config()
+        if not config.get("supabase", {}).get("enabled"):
+            print("Supabase is not enabled in config/env.")
+            return 1
+        supabase_url = os.getenv("SUPABASE_URL")
+        service_role_key = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+        if not supabase_url or not service_role_key:
+            print("SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY are required.")
+            return 1
+        sink = SupabaseSink(supabase_url, service_role_key, args.run_id)
+        counts = sync_run_directory(Path(args.artifacts_root), args.run_id, sink)
+        print(json.dumps({"run_id": args.run_id, **counts}, indent=2))
         return 0
 
     parser.print_help()

@@ -10,3 +10,4 @@ urllib3
 dicttoxml
 rich
 presidio-analyzer
+playwright

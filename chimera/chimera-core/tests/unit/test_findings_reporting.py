@@ -47,5 +47,57 @@ def test_report_builder_writes_outputs(tmp_path: Path):
     artifacts = report.write_reports("run-2", findings)
 
     assert artifacts.findings_path.exists()
+    assert artifacts.chains_path.exists()
+    assert artifacts.chain_graphs_path.exists()
+    assert artifacts.rejected_findings_path.exists()
     assert artifacts.report_path.exists()
     assert artifacts.summary_path.exists()
+
+
+def test_chain_summary_includes_extended_fields() -> None:
+    finding = make_finding("IDOR", "https://example.com/api/users/7", "high")
+    finding.finding_type = "IDOR"
+    finding.asset = {"endpoint": "/api/users/{id}", "method": "GET"}
+    finding.confidence = 0.85
+    finding.chain_parent_ids = ["root-1"]
+    finding.impact_path = [{"step": "pivot", "impact": "AccountTakeover", "evidence": "token reuse"}]
+
+    summary = finding.to_chain_summary()
+
+    assert "IDOR on GET /api/users/{id}" in summary
+    assert "0.85" in summary
+    assert "AccountTakeover" in summary
+
+
+def test_report_builder_counts_exploit_chains(tmp_path: Path) -> None:
+    finding = make_finding("Exploit chain", "https://example.com", "critical", run_id="run-3")
+    finding.finding_type = "EXPLOIT_CHAIN"
+    finding.validation_status = "confirmed"
+    finding.chain_parent_ids = ["f1", "f2"]
+
+    report = ReportBuilder(tmp_path)
+    artifacts = report.write_reports("run-3", [finding])
+    summary = artifacts.summary_path.read_text(encoding="utf-8")
+    markdown = artifacts.report_path.read_text(encoding="utf-8")
+    chains = artifacts.chains_path.read_text(encoding="utf-8")
+    chain_graphs = artifacts.chain_graphs_path.read_text(encoding="utf-8")
+
+    assert '"exploit_chains": 1' in summary
+    assert "## Exploit Chains" in markdown
+    assert "EXPLOIT_CHAIN" in chains
+    assert "ascii" in chain_graphs
+
+
+def test_report_builder_lists_rejected_findings(tmp_path: Path) -> None:
+    finding = make_finding("Rejected finding", "https://example.com", "medium", run_id="run-4")
+    finding.validation_status = "false_positive"
+    finding.validation_reason = "Cross-user replay was blocked."
+
+    report = ReportBuilder(tmp_path)
+    artifacts = report.write_reports("run-4", [finding])
+
+    rejected = artifacts.rejected_findings_path.read_text(encoding="utf-8")
+    markdown = artifacts.report_path.read_text(encoding="utf-8")
+
+    assert "Cross-user replay was blocked." in rejected
+    assert "## Rejected Findings" in markdown
