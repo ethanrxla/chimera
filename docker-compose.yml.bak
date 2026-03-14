@@ -1,0 +1,17 @@
+version: '3.8'
+
+services:
+  kali-linux:
+    image: kalilinux/kali-rolling:latest
+    container_name: kali-container
+    restart: unless-stopped
+    tty: true
+    stdin_open: true
+    volumes:
+      - ./kali_data:/root
+      - ./shared:/shared
+    environment:
+      - DISPLAY=${DISPLAY}
+    network_mode: host
+    privileged: true
+    command: /bin/bash

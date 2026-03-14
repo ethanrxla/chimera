@@ -1,0 +1,22 @@
+{
+  "findings": [
+    {
+      "title": "Reflected XSS",
+      "description": "Reflected XSS in parameter q",
+      "severity": "high",
+      "url": "https://www.example.com/search?q=test"
+    },
+    {
+      "title": "CORS Misconfiguration",
+      "description": "Wildcard Access-Control-Allow-Origin",
+      "severity": "medium",
+      "url": "https://www.example.com/api"
+    },
+    {
+      "title": "Open Redirect",
+      "description": "Open redirect via next parameter",
+      "severity": "medium",
+      "url": "https://www.example.com/redirect?next=https://evil.com"
+    }
+  ]
+}

@@ -1,0 +1,13 @@
+allowlist:
+  - "https://incomparable-gnome-e53305.netlify.app"
+  - "https://neon-concha-21989f.netlify.app"
+
+denylist: []
+
+rate_limits:
+  requests_per_second: 2
+  concurrency: 1
+
+allowed_methods:
+  - "GET"
+  - "HEAD"

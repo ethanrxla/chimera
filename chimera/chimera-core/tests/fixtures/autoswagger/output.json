@@ -1,0 +1,23 @@
+{
+  "endpoints": [
+    {
+      "url": "https://api.example.com/users",
+      "method": "GET",
+      "status": 200,
+      "pii": ["email"],
+      "secrets": [],
+      "response_size": 2048
+    },
+    {
+      "url": "https://api.example.com/admin",
+      "method": "GET",
+      "status": 401,
+      "pii": [],
+      "secrets": [],
+      "response_size": 120
+    }
+  ],
+  "stats": {
+    "requests": 2
+  }
+}

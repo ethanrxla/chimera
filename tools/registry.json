@@ -1,0 +1,38 @@
+{
+  "tools": {
+    "autoswagger": {
+      "enabled": true,
+      "type": "python",
+      "entrypoint": ["python", "/app/tools/autoswagger/autoswagger.py"],
+      "workdir": "/app/tools/autoswagger"
+    },
+    "strix": {
+      "enabled": true,
+      "type": "python",
+      "entrypoint": ["python", "-m", "strix.interface.main", "-n"],
+      "workdir": "/app/tools/strix"
+    },
+    "shannon": {
+      "enabled": true,
+      "type": "command",
+      "entrypoint": []
+    },
+    "zypheron": {
+      "enabled": true,
+      "type": "binary",
+      "binary": "/app/tools/zypheron/zypheron"
+    },
+    "vibepentester": {
+      "enabled": true,
+      "type": "python",
+      "entrypoint": ["python", "main.py"],
+      "workdir": "/app/tools/vibe-pentester"
+    },
+    "decepticon": {
+      "enabled": true,
+      "type": "python",
+      "entrypoint": ["python", "decepticon.py"],
+      "workdir": "/app/tools/decepticon"
+    }
+  }
+}

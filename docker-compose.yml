@@ -1,0 +1,40 @@
+version: "3.8"
+services:
+  chimera-core:
+    build:
+      context: .
+      dockerfile: chimera/docker/core.Dockerfile
+    container_name: chimera-core
+    working_dir: /app
+    volumes:
+      - ./chimera/chimera-core:/app/chimera-core
+      - ./tools:/app/tools
+      - ./scope.yml:/app/chimera-core/scope.yml
+      - ./kali_data/artifacts:/artifacts
+      - ./kali_data/cache:/cache
+    environment:
+      - CHIMERA_ARTIFACTS_DIR=/artifacts
+      - CHIMERA_CACHE_DIR=/cache
+      - PYTHONPATH=/app/chimera-core
+    env_file:
+      - .env
+    ports:
+      - "8000:8000"
+    command: ["bash", "-lc", "cd chimera-core && /opt/venv/bin/uvicorn chimera_core.api.app:create_app --factory --host 0.0.0.0 --port 8000"]
+    restart: unless-stopped
+
+  chimera-ui:
+    build:
+      context: .
+      dockerfile: chimera/docker/ui.Dockerfile
+    container_name: chimera-ui
+    working_dir: /app
+    volumes:
+      - ./chimera/chimera-ui:/app/chimera-ui
+      - ./kali_data/artifacts:/artifacts
+    environment:
+      - CHIMERA_API_URL=http://chimera-core:8000/v1
+    depends_on:
+      - chimera-core
+    command: ["bash", "-lc", "cd chimera-ui && xvfb-run -a python3 launcher.py"]
+    restart: unless-stopped

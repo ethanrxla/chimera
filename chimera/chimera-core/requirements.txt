@@ -1,0 +1,12 @@
+pyyaml
+pytest
+pytest-cov
+fastapi
+uvicorn
+httpx
+requests
+beautifulsoup4
+urllib3
+dicttoxml
+rich
+presidio-analyzer

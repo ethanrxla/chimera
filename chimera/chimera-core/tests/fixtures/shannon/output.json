@@ -1,0 +1,14 @@
+{
+  "findings": [
+    {
+      "title": "SQL Injection in login",
+      "description": "Payload bypassed authentication on the login endpoint.",
+      "severity": "high",
+      "target": "https://example.com/login",
+      "evidence": {
+        "evidence_refs": ["poc.sql"],
+        "repro_guidance": "Use payload ' OR 1=1-- on the username field."
+      }
+    }
+  ]
+}

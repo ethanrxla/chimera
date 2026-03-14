@@ -1,0 +1,160 @@
+# Crypto.com Bug Bounty Program Scope
+# Program: https://hackerone.com/crypto
+#
+# ⚠️ IMPORTANT: Always verify current scope on HackerOne before testing
+# ⚠️ Follow all HackerOne program rules and disclosure policies
+# ⚠️ Do not test without explicit authorization
+
+allowlist:
+  # Main domains
+  - "https://crypto.com"
+  - "https://crypto.com/*"
+  - "https://www.crypto.com"
+  - "https://www.crypto.com/*"
+
+  # Subdomains (based on provided targets)
+  - "https://web.crypto.com"
+  - "https://web.crypto.com/*"
+  - "https://merchant.crypto.com"
+  - "https://merchant.crypto.com/*"
+  - "https://js.crypto.com"
+  - "https://js.crypto.com/*"
+
+  # NFT platform
+  - "https://crypto.com/nft"
+  - "https://crypto.com/nft/*"
+
+  # Exchange (if specified as in-scope on HackerOne)
+  - "https://crypto.com/exchange"
+  - "https://crypto.com/exchange/*"
+
+  # Nadex (verify on HackerOne if still in scope)
+  - "https://nadex.com"
+  - "https://nadex.com/*"
+  - "https://www.nadex.com"
+  - "https://www.nadex.com/*"
+
+  # Wildcard for crypto.com subdomains
+  # ⚠️ Use cautiously - verify each subdomain is in scope
+  - "https://*.crypto.com"
+
+denylist:
+  # Third-party services (typically out of scope)
+  - "*.amazonaws.com"
+  - "*.cloudfront.net"
+  - "*.cloudflare.com"
+  - "*.akamai.net"
+  - "*.fastly.net"
+
+  # Analytics and marketing (typically out of scope)
+  - "*.google-analytics.com"
+  - "*.googletagmanager.com"
+  - "*.doubleclick.net"
+  - "*.facebook.com"
+  - "*.twitter.com"
+  - "*.linkedin.com"
+
+  # CDN and static assets (typically out of scope)
+  - "*.cdn.crypto.com"
+  - "*.static.crypto.com"
+
+  # Common out-of-scope patterns
+  - "status.crypto.com"
+  - "blog.crypto.com"
+  - "*.blog.crypto.com"
+
+  # Etherscan (external blockchain explorer - not owned by Crypto.com)
+  - "*.etherscan.io"
+
+# Authentication notes
+# ⚠️ Update with your actual HackerOne username/identifier
+auth_notes: |
+  HackerOne Program: crypto
+  Tester: rxla
+
+  Authorization:
+  - Follow HackerOne disclosure policy
+  - Report findings only through HackerOne platform
+  - Do not access user data without permission
+  - Do not perform DoS attacks
+  - Do not perform destructive tests on production
+
+  Headers to include:
+  - X-HackerOne: rxla
+  - X-Bug-Bounty: crypto
+
+# Rate limits (conservative for production testing)
+rate_limits:
+  # Requests per second (keep low to avoid DoS)
+  requests_per_second: 2
+
+  # Maximum concurrent requests
+  concurrency: 2
+
+  # Total request budget per scan (optional)
+  max_requests_per_scan: 10000
+
+# Allowed HTTP methods (safe methods only by default)
+allowed_methods:
+  - "GET"
+  - "HEAD"
+  - "OPTIONS"
+  # Uncomment below only if testing forms/APIs:
+  # - "POST"
+  # - "PUT"
+  # - "PATCH"
+  # - "DELETE"
+
+# Special notes for Crypto.com testing
+notes: |
+  BEFORE SCANNING:
+  1. ✅ Verify current scope on https://hackerone.com/crypto/policy_scopes
+  2. ✅ Read the full program policy and rules
+  3. ✅ Check for any recent scope changes or announcements
+  4. ✅ Ensure you have a HackerOne account in good standing
+  5. ✅ Update auth_notes with your HackerOne username
+
+  DURING SCANNING:
+  - Start with passive reconnaissance (fixture mode)
+  - Use low rate limits to avoid detection as malicious
+  - Do not test destructive vulnerabilities without explicit permission
+  - Do not attempt to access other users' data
+  - Stop immediately if you discover something critical and report it
+
+  FORBIDDEN ACTIVITIES (typically):
+  - Social engineering attacks
+  - Physical security testing
+  - Denial of Service (DoS/DDoS)
+  - Spamming
+  - Accessing other users' accounts without permission
+  - Testing on production databases
+
+  AFTER FINDINGS:
+  - Report through HackerOne platform only
+  - Do not disclose publicly until program approves
+  - Provide detailed reproduction steps
+  - Include proof-of-concept (non-destructive)
+
+  MOBILE APPS:
+  - com.defi.wallet - Check HackerOne for mobile app testing rules
+  - May require separate authorization
+
+# Tool-specific settings
+tool_settings:
+  # Zypheron (asset discovery)
+  zypheron:
+    aggressive_mode: false  # Keep passive for bug bounty
+    subdomain_bruteforce: false  # Only use wordlists, no brute force
+    port_scan_range: "common"  # Only common ports, not full range
+
+  # VibePentester (penetration testing)
+  vibepentester:
+    aggressive_mode: false
+    enable_sqlmap: false  # Enable only if program allows
+    enable_fuzzing: false  # Enable only if program allows
+
+  # Strix (web scanner)
+  strix:
+    crawl_depth: 3  # Limit depth to avoid excessive requests
+    follow_redirects: true
+    check_robots_txt: true
