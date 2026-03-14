@@ -23,6 +23,25 @@ services:
     command: ["bash", "-lc", "cd chimera-core && /opt/venv/bin/uvicorn chimera_core.api.app:create_app --factory --host 0.0.0.0 --port 8000"]
     restart: unless-stopped
 
+  chimera-cli:
+    build:
+      context: .
+      dockerfile: chimera/docker/cli.Dockerfile
+    container_name: chimera-cli
+    working_dir: /app
+    volumes:
+      - .:/app
+      - cli_cargo:/cargo
+      - cli_rustup:/rustup
+    environment:
+      - CHIMERA_API_BASE=http://chimera-core:8000/v1
+    depends_on:
+      - chimera-core
+    stdin_open: true
+    tty: true
+    command: ["bash", "-lc", "cd /app/chimera/chimera-cli && cargo run -- --help"]
+    restart: unless-stopped
+
   chimera-ui:
     build:
       context: .
@@ -38,3 +57,17 @@ services:
       - chimera-core
     command: ["bash", "-lc", "cd chimera-ui && xvfb-run -a python3 launcher.py"]
     restart: unless-stopped
+
+  metasploitable2:
+    image: tleemcjr/metasploitable2
+    container_name: metasploitable2
+    profiles: ["lab"]
+    ports:
+      - "2222:22"
+      - "8080:80"
+      - "8443:443"
+    restart: unless-stopped
+
+volumes:
+  cli_cargo:
+  cli_rustup:
