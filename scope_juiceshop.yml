@@ -1,0 +1,38 @@
+# OWASP Juice Shop - intentionally vulnerable lab target
+# Safe to test: this is a local Docker container running a known-vulnerable app
+
+allowlist:
+  - "http://juice-shop:3000"
+  - "http://juice-shop:3000/*"
+
+denylist: []
+
+rate_limits:
+  requests_per_second: 10
+  concurrency: 4
+  max_requests_per_scan: 50000
+
+allowed_methods:
+  - "GET"
+  - "HEAD"
+  - "OPTIONS"
+  - "POST"
+  - "PUT"
+  - "PATCH"
+  - "DELETE"
+
+tool_settings:
+  strix:
+    crawl_depth: 5
+    follow_redirects: true
+    check_robots_txt: false
+
+  zypheron:
+    aggressive_mode: true
+    subdomain_bruteforce: false
+    port_scan_range: "common"
+
+  vibepentester:
+    aggressive_mode: true
+    enable_sqlmap: true
+    enable_fuzzing: true

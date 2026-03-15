@@ -65,6 +65,14 @@ services:
     command: ["bash", "-lc", "cd chimera-ui && xvfb-run -a python3 launcher.py"]
     restart: unless-stopped
 
+  juice-shop:
+    image: bkimminich/juice-shop
+    container_name: juice-shop
+    profiles: ["lab"]
+    ports:
+      - "3000:3000"
+    restart: unless-stopped
+
   metasploitable2:
     image: tleemcjr/metasploitable2
     container_name: metasploitable2
