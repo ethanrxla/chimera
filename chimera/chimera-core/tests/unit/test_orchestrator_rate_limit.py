@@ -7,7 +7,7 @@ def test_orchestrator_applies_rate_limit(monkeypatch, tmp_path: Path):
     captured = {}
 
     class FakeRuntime:
-        def __init__(self, scope_graph, scope_policy, event_store, artifacts_root, run_id, cancel_event=None):
+        def __init__(self, scope_graph, scope_policy, event_store, artifacts_root, run_id, cancel_event=None, **kwargs):
             captured["max_rps"] = scope_policy.max_rps
             self.scope_graph = scope_graph
             self.scope_policy = scope_policy

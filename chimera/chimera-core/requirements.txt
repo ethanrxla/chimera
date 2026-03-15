@@ -1,6 +1,8 @@
 pyyaml
 pytest
 pytest-cov
+pytest-asyncio
+anyio[trio]
 fastapi
 uvicorn
 httpx

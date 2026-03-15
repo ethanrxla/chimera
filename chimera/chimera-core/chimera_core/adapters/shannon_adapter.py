@@ -299,10 +299,10 @@ def _infer_finding_type(title: str, description: str, repro_guidance: Optional[s
         return "RATE_LIMIT"
     if "xss" in text:
         return "XSS"
-    if "auth" in text:
-        return "BROKEN_AUTH"
     if re.search(r"\bsqli?\b|sql injection", text):
         return "SQLI"
+    if "auth" in text:
+        return "BROKEN_AUTH"
     return "HYPOTHESIS"
 
 

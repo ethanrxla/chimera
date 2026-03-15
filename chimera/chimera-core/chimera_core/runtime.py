@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import ipaddress
 import os
 import socket
@@ -6,7 +8,7 @@ import threading
 import time
 from typing import Iterable, List, Optional, Set, Dict, Any
 from pathlib import Path
-import requests # Import requests
+import requests
 
 from chimera_core.scope import ScopeGraph, ScopePolicy
 from chimera_core.ratelimit import RateLimiter
@@ -392,7 +394,7 @@ class Runtime:
         query: Optional[Dict[str, Any]] = None,
         body: Optional[Dict[str, Any]] = None,
         files: Optional[Dict[str, Any]] = None,
-        auth: Optional[requests.auth.HTTPBasicAuth] = None,
+        auth: Any = None,
     ) -> requests.Response:
         # Here you would implement the actual rate limiting and retry logic
         # For now, it's a direct call using requests.

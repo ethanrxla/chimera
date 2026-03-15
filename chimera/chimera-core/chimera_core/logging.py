@@ -25,7 +25,7 @@ def setup_logging(level: Optional[str] = None) -> logging.Logger:
 
 def log_event(logger: logging.Logger, level: str, message: str, **fields: Any) -> None:
     payload = {"message": message, **fields}
-    text = json.dumps(payload, ensure_ascii=True)
+    text = json.dumps(payload, ensure_ascii=True, default=str)
     lvl = level.upper()
     if lvl == "DEBUG":
         logger.debug(text)

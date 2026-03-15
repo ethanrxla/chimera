@@ -10,7 +10,7 @@ class FakePage:
     def __init__(self) -> None:
         self.url = ""
         self._handlers = {}
-        self._content = "<script>node.innerHTML = location.search; window.addEventListener('message', handler)</script>"
+        self._content = "<script>node.innerHTML = location.search; window.addEventListener('message', handler)</script><svg>"
 
     def on(self, event: str, handler) -> None:
         self._handlers[event] = handler

@@ -11,6 +11,10 @@ from chimera_core.tool_runner import ToolRunner
 from chimera_core.scope import ScopeGraph, ScopePolicy
 
 
+def _command_return_code(result: object) -> int:
+    return int(getattr(result, "returncode", getattr(result, "exit_code", 0)))
+
+
 class AutoswaggerAdapter(AdapterBase):
     id = "autoswagger"
     capabilities = ["api-testing"]
@@ -104,6 +108,10 @@ class AutoswaggerAdapter(AdapterBase):
                 timeout_s=timeout,
                 cwd=Path(self.tool_path).parent,
             )
+            return_code = _command_return_code(result)
+            if return_code != 0:
+                error_message = (result.stderr or result.stdout or f"{self.id} exited with code {return_code}").strip()
+                raise RuntimeError(error_message)
             raw_output = result.stdout
         else:
             self._emit_event("cmd_started", {"run_id": self.run_id, "task_id": self.task_id, "mode": "fixture"})

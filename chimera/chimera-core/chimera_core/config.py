@@ -3,6 +3,23 @@ import os
 from pathlib import Path
 from typing import Any, Dict
 
+def _env_bool(name: str, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.lower() in {"true", "1", "yes", "on"}
+
+
+def _env_float(name: str, default: float) -> float:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    try:
+        return float(value)
+    except ValueError:
+        return default
+
+
 def _get_default_config() -> Dict[str, Any]:
     """
     Generate default config with supabase auto-enabled if env vars are present.
@@ -20,6 +37,7 @@ def _get_default_config() -> Dict[str, Any]:
 
     # Parse allow_destructive flag
     allow_destructive = os.getenv("CHIMERA_ALLOW_DESTRUCTIVE", "false").lower() in {"true", "1", "yes"}
+    shannon_base_url = os.getenv("SHANNON_BASE_URL", "http://localhost:8080").rstrip("/")
 
     return {
         "project": {
@@ -41,10 +59,13 @@ def _get_default_config() -> Dict[str, Any]:
             "destructive_tools": ["sqlmap", "ffuf", "hydra", "wfuzz"],
         },
         "shannon": {
-            "enabled": True,  # Enable Shannon for AI-powered verification
+            "enabled": _env_bool("CHIMERA_SHANNON_ENABLED", True),
+            "verify_availability": _env_bool("CHIMERA_SHANNON_VERIFY_AVAILABILITY", True),
             "mode": "verify",
             "driver": "http",
-            "base_url": "http://localhost:8080",
+            "base_url": shannon_base_url,
+            "healthcheck_url": os.getenv("SHANNON_HEALTHCHECK_URL", f"{shannon_base_url}/health"),
+            "availability_timeout_s": _env_float("SHANNON_AVAILABILITY_TIMEOUT_S", 2.0),
             "vuln_types": ["injection", "xss", "ssrf", "broken_auth"],
             "output_file": "findings.json",
             "query_template": (

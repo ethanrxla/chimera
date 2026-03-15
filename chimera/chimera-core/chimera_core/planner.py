@@ -5,6 +5,8 @@ The planner is responsible for selecting the right tools and structuring their
 execution as a Directed Acyclic Graph (DAG). This allows for managing
 dependencies and scheduling concurrent tasks safely.
 """
+from urllib.error import HTTPError, URLError
+from urllib.request import urlopen
 from typing import Dict, List, Tuple
 
 from chimera_core.capabilities.registry import get_capabilities_for_target
@@ -73,6 +75,38 @@ def _fallback_sequence(shannon_enabled: bool) -> List[str]:
     return sequence
 
 
+def _shannon_is_available(shannon_config: Dict[str, object]) -> bool:
+    if not bool(shannon_config.get("enabled")):
+        return False
+    if not bool(shannon_config.get("verify_availability", True)):
+        return True
+
+    driver = str(shannon_config.get("driver", "http")).lower()
+    if driver != "http":
+        return True
+
+    base_url = str(shannon_config.get("base_url") or "").rstrip("/")
+    candidates = []
+    healthcheck_url = str(shannon_config.get("healthcheck_url") or "").strip()
+    if healthcheck_url:
+        candidates.append(healthcheck_url)
+    if base_url:
+        default_health_url = f"{base_url}/health"
+        if default_health_url not in candidates:
+            candidates.append(default_health_url)
+
+    timeout_s = float(shannon_config.get("availability_timeout_s") or 2.0)
+    for candidate in candidates:
+        try:
+            with urlopen(candidate, timeout=timeout_s):
+                return True
+        except HTTPError:
+            return True
+        except (URLError, OSError, ValueError):
+            continue
+    return False
+
+
 def _build_tasks_for_target(
     plan: ExecutionPlan,
     *,
@@ -87,7 +121,7 @@ def _build_tasks_for_target(
         if capability == "autoswagger":
             options = {"json": True}
         elif capability == "strix":
-            options = {"scan_mode": "default"}
+            options = {"scan_mode": "standard"}
         elif capability == "shannon":
             options = dict(shannon_options)
         task_id = f"{capability}-{index}-{step_index}"
@@ -112,7 +146,7 @@ def generate_plan(scope_graph, scope_policy, context) -> ExecutionPlan:
     plan = ExecutionPlan()
     config = load_config()
     shannon_config = config.get("shannon", {})
-    shannon_enabled = bool(shannon_config.get("enabled"))
+    shannon_enabled = _shannon_is_available(shannon_config)
     shannon_options = {
         "vuln_types": shannon_config.get(
             "vuln_types",
@@ -124,6 +158,7 @@ def generate_plan(scope_graph, scope_policy, context) -> ExecutionPlan:
         "config_path": shannon_config.get("config_path"),
         "output_file": shannon_config.get("output_file"),
         "query_template": shannon_config.get("query_template"),
+        "healthcheck_url": shannon_config.get("healthcheck_url"),
     }
     shannon_options = {key: value for key, value in shannon_options.items() if value is not None}
     context = context or {}

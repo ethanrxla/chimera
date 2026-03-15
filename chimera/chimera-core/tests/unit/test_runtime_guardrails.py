@@ -52,13 +52,24 @@ def test_runtime_blocks_target_override(runtime, monkeypatch):
         runtime.run_cmd(command)
 
 
-def test_runtime_blocks_private_ip_resolution(runtime, monkeypatch):
+def test_runtime_blocks_private_ip_resolution(tmp_path, monkeypatch):
+    scope_manifest = {"allowlist": ["example.com"], "denylist": [], "allow_private_ips": False}
+    scope_graph = ScopeGraph(scope_manifest)
+    scope_policy = ScopePolicy(scope_manifest)
+    event_store = EventStore(tmp_path / "events.jsonl")
+    rt = Runtime(
+        scope_graph=scope_graph,
+        scope_policy=scope_policy,
+        event_store=event_store,
+        artifacts_root=tmp_path / "artifacts",
+    )
+
     def fake_getaddrinfo(host, port, *args, **kwargs):
         return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", 0))]
     monkeypatch.setattr(socket, "getaddrinfo", fake_getaddrinfo)
-    runtime._execute_subprocess = Mock(return_value=Mock(stdout="", stderr="", returncode=0))
+    rt._execute_subprocess = Mock(return_value=Mock(stdout="", stderr="", returncode=0))
     with pytest.raises(ValueError, match="Target out of scope"):
-        runtime.run_cmd(["curl", "https://example.com"])
+        rt.run_cmd(["curl", "https://example.com"])
 
 
 def test_runtime_blocks_raw_ip_without_allow(runtime):

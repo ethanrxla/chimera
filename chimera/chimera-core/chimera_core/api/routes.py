@@ -256,7 +256,7 @@ def _generate_recon_plan(scope_graph, scope_policy):
             task_id=f"vibepentester-scan-{i}",
             tool="vibepentester",
             target=domain,
-            options={"scan_mode": "default"}
+            options={"scan_mode": "standard"}
         )
         plan.add_task(vibe_task)
         plan.add_dependency(zypheron_task.task_id, vibe_task.task_id)
@@ -965,6 +965,13 @@ async def create_run(request: Request, payload: Dict[str, object]):
         status = "completed"
         if cancel_event.is_set():
             status = "cancelled"
+        elif run_id:
+            try:
+                status = request.app.state.run_store.get_run(run_id).data.get("status", status)
+            except FileNotFoundError:
+                pass
+        else:
+            status = "failed"
         request.app.state.runs[job.job_id].update({
             "status": status,
             "run_id": run_id,

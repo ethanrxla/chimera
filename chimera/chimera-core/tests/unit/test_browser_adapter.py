@@ -27,17 +27,38 @@ def make_runtime(tmp_path: Path) -> Runtime:
 
 @pytest.mark.asyncio
 async def test_browser_trace_xss_sink_confirms_payload() -> None:
-    async def fake_browser(url, auth_cookies):
-        return {
-            "url": url,
-            "network": [],
-            "console": [],
-            "page_source": "node.innerHTML = location.search",
-            "script_srcs": [],
-            "dom_sinks": [{"type": "innerHTML", "evidence": url, "parameter": "q"}],
-        }
+    class _Page:
+        url = ""
+        def on(self, event, handler): pass
+        async def goto(self, url, timeout=0): self.url = url
+        async def fill(self, selector, value, timeout=0): pass
+        async def wait_for_load_state(self, state, timeout=0): pass
+        async def content(self): return "reflected: <svg>"
+        async def screenshot(self): return b"fake"
+        async def eval_on_selector_all(self, sel, script): return []
+        async def evaluate(self, js): return []
 
-    adapter = BrowserAdapter(make_runtime(Path("/tmp")), options={"browser_factory": fake_browser})
+    class _Tracing:
+        async def start(self, **kw): pass
+        async def stop(self): pass
+
+    class _Context:
+        def __init__(self):
+            self.tracing = _Tracing()
+        async def new_page(self): return _Page()
+        async def add_cookies(self, cookies): pass
+
+    class _Browser:
+        async def new_context(self): return _Context()
+        async def close(self): pass
+
+    async def fake_playwright_factory(headless: bool):
+        b = _Browser()
+        ctx = await b.new_context()
+        page = await ctx.new_page()
+        return b, ctx, page
+
+    adapter = BrowserAdapter(make_runtime(Path("/tmp")), options={"playwright_factory": fake_playwright_factory})
     result = await adapter.trace_xss_sink("https://www.example.com/search", "q", "<svg>")
 
     assert result["status"] == "confirmed"

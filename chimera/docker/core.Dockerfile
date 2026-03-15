@@ -21,6 +21,7 @@ RUN apt-get update && apt-get install -y \
     libpcap-dev \
     libgmp-dev libmpfr-dev binutils \
     poppler-utils \
+    docker.io \
     nmap masscan \
  && rm -rf /var/lib/apt/lists/*
 
@@ -28,9 +29,12 @@ WORKDIR /app
 
 RUN python3 -m venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
+ENV PLAYWRIGHT_BROWSERS_PATH="/ms-playwright"
 
 COPY chimera/chimera-core/requirements.txt /tmp/requirements.txt
-RUN pip3 install --no-cache-dir -r /tmp/requirements.txt
+RUN pip3 install --no-cache-dir --upgrade --force-reinstall -r /tmp/requirements.txt
+RUN mkdir -p "${PLAYWRIGHT_BROWSERS_PATH}" \
+ && playwright install --with-deps chromium
 
 COPY tools/strix /app/tools/strix
 RUN pip3 install --no-cache-dir -e /app/tools/strix

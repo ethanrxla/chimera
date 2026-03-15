@@ -11,6 +11,10 @@ from chimera_core.runtime import Runtime
 from chimera_core.tool_runner import ToolRunner
 
 
+def _command_return_code(result: object) -> int:
+    return int(getattr(result, "returncode", getattr(result, "exit_code", 0)))
+
+
 class StrixAdapter(AdapterBase):
     id = "strix"
     capabilities = ["web-testing", "recon"]
@@ -164,6 +168,10 @@ class StrixAdapter(AdapterBase):
                 timeout_s=timeout,
                 cwd=self.strix_root,
             )
+            return_code = _command_return_code(result)
+            if return_code not in {0, 2}:
+                error_message = (result.stderr or result.stdout or f"{self.id} exited with code {return_code}").strip()
+                raise RuntimeError(error_message)
             parsed = self._parse_strix_findings(run_name, targets)
             raw_output = json.dumps({"findings": parsed})
         else:

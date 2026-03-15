@@ -266,6 +266,7 @@ class Orchestrator:
                     "run_id": run.run_id,
                     "job_id": job_id,
                     "tasks_completed": len(results),
+                    "tasks_failed": len([result for result in results if result.status != "completed"]),
                     "message": f"Completed execution of {len(results)} tasks"
                 }
             })
@@ -274,6 +275,9 @@ class Orchestrator:
             for result in results:
                 collected.extend(result.findings)
 
+            failed_results = [result for result in results if result.status != "completed"]
+            run_status = "failed" if failed_results else "completed"
+
             deduped, duplicates = dedupe_findings(collected)
 
             for finding in deduped:
@@ -281,9 +285,11 @@ class Orchestrator:
             local_sink.flush()
             run_store.update_run(
                 run.run_id,
-                status="completed",
+                status=run_status,
                 stats={
                     "tasks_total": len(plan.tasks),
+                    "tasks_succeeded": len([result for result in results if result.status == "completed"]),
+                    "tasks_failed": len(failed_results),
                     "findings_total": len(deduped),
                     "duplicates": duplicates,
                     "exploit_chains": len([finding for finding in deduped if finding.finding_type == "EXPLOIT_CHAIN"]),
@@ -324,18 +330,29 @@ class Orchestrator:
                     )
 
             # 5. Results Analysis (Simplified)
-            job.status = JobStatus.ANALYZING_RESULTS
+            job.status = JobStatus.ANALYZING_RESULTS if not failed_results else JobStatus.FAILED
             print(f"[Orchestrator] Job {job_id} status: {job.status.value}")
             job.findings.extend([finding.to_dict() for finding in deduped])
             for finding in deduped:
                 self._emit_event(event_sink, "finding_created", {"job_id": job_id, "finding": finding.to_dict()})
 
-            job.status = JobStatus.COMPLETED
+            job.status = JobStatus.COMPLETED if not failed_results else JobStatus.FAILED
             job.ended_at = datetime.now(timezone.utc)
             if sink:
-                sink.emit_event({"event_type": "run_finished", "payload": {"run_id": run.run_id, "job_id": job_id}})
+                final_event = "run_finished" if not failed_results else "run_failed"
+                sink.emit_event(
+                    {
+                        "event_type": final_event,
+                        "payload": {
+                            "run_id": run.run_id,
+                            "job_id": job_id,
+                            "failed_tasks": [result.task_id for result in failed_results],
+                        },
+                    }
+                )
                 sink.flush()
-            self._emit_event(event_sink, "run_finished", {"job_id": job_id, "status": job.status.value})
+            terminal_event = "run_finished" if not failed_results else "run_failed"
+            self._emit_event(event_sink, terminal_event, {"job_id": job_id, "status": job.status.value})
             print(f"[Orchestrator] Job {job_id} completed with status {job.status.value}")
             print(f"[Orchestrator] Findings: {len(deduped)} (deduped {duplicates})")
             print(f"[Orchestrator] Artifacts: {run.artifacts_dir}")

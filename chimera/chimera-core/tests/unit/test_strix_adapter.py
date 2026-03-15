@@ -44,16 +44,17 @@ def make_adapter(tmp_path, options=None, rate_limits=None, scope_hash="scope-456
 def test_strix_build_command_includes_rate_and_flags(tmp_path):
     adapter = make_adapter(
         tmp_path=tmp_path,
-        options={"scan_mode": "full", "aggressive": True},
+        options={"scan_mode": "full"},
         rate_limits={"requests_per_second": 5},
     )
     command = adapter.build_command(["https://www.example.com"])
     assert "python" in command[0]
-    assert str(adapter.tool_path) in command
-    assert "--mode" in command and "full" in command
-    assert "--aggressive" in command
-    assert "--rate" in command and "5" in command
+    assert "-m" in command
+    assert "strix.interface.main" in command
+    assert "--scan-mode" in command and "full" in command
     assert "https://www.example.com" in command
+    # rate is embedded in the instruction string
+    assert any("5 rps" in arg for arg in command)
 
 def test_strix_enforces_scope(tmp_path):
     adapter = make_adapter(tmp_path=tmp_path)
@@ -109,9 +110,9 @@ def test_strix_run_uses_runtime_command(tmp_path: Path):
 
     assert adapter.runtime.run_cmd.called
     command = adapter.runtime.run_cmd.call_args.args[0]
-    assert str(adapter.tool_path) in command
-    assert "--mode" in command and "full" in command
-    assert "--rate" in command and "3" in command
+    assert "strix.interface.main" in command
+    assert "--scan-mode" in command and "full" in command
+    assert any("3 rps" in arg for arg in command)
     assert "https://www.example.com" in command
 
 
