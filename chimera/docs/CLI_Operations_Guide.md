@@ -30,6 +30,8 @@ via `/v1/parser/interpret`.
 cd /home/theif/projects/kali-docker/chimera/chimera-cli
 . "$HOME/.cargo/env"
 
+cargo run --
+cargo run -- console
 cargo run -- --target https://crapi.example.com
 cargo run -- scan --target https://juice-shop.local --pipeline recon
 cargo run -- status
@@ -37,6 +39,23 @@ cargo run -- viz --run <run_id>
 cargo run -- chain --run <run_id>
 cargo run -- exploit --run <run_id> <chain_id> --replay
 cargo run -- oracle --run <run_id> "What could go wrong with this GraphQL endpoint?"
+```
+
+Running `cargo run --` in a TTY now opens the idle Chimera console. It uses a ratatui control
+surface with recent runs, selected-run telemetry, findings, and a command prompt. The prompt accepts
+both direct commands and freeform input staged through `/v1/parser/interpret`.
+
+Useful console commands:
+
+```text
+set target https://crapi.example.com
+set pipeline recon
+set program HackerOne Demo
+run
+show runs
+use <run_id>
+show findings
+oracle What could go wrong with this GraphQL endpoint?
 ```
 
 ## Browser Operations

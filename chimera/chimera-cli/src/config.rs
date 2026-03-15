@@ -48,8 +48,12 @@ pub fn read_scope_file(path: &Path) -> Result<String> {
 }
 
 pub fn build_scope_text(target: &str) -> Result<String> {
+    build_scope_manifest_text(&[target.to_string()])
+}
+
+pub fn build_scope_manifest_text(targets: &[String]) -> Result<String> {
     let payload = serde_yaml::to_string(&serde_json::json!({
-        "allowlist": [target],
+        "allowlist": targets,
         "denylist": [],
     }))
     .context("failed to build scope manifest")?;

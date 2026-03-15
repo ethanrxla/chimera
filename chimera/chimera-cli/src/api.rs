@@ -80,6 +80,22 @@ impl ApiClient {
         self.get_json(&format!("/runs/{run_id}/findings")).await
     }
 
+    pub async fn interpret_input(&self, text: &str) -> Result<Value> {
+        self.post_json("/parser/interpret", &json!({ "text": text }))
+            .await
+    }
+
+    pub async fn shannon_oracle(&self, question: &str, target: Option<&str>) -> Result<Value> {
+        self.post_json(
+            "/shannon/oracle",
+            &json!({
+                "question": question,
+                "target": target,
+            }),
+        )
+        .await
+    }
+
     #[allow(dead_code)]
     pub async fn finding_detail(&self, run_id: &str, stable_id: &str) -> Result<FindingDetail> {
         self.get_json(&format!("/runs/{run_id}/findings/{stable_id}"))

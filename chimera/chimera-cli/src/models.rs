@@ -15,7 +15,7 @@ pub struct RunCreationResponse {
     pub note: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Default)]
 pub struct ActiveRunStatus {
     #[serde(default)]
     pub run_id: Option<String>,
@@ -51,7 +51,7 @@ pub struct SafetyState {
     pub blocked_reasons: Vec<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Default)]
 pub struct StatusResponse {
     #[serde(default)]
     pub mode: String,
