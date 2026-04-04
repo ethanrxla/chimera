@@ -63,7 +63,10 @@ class BrowserAutomation:
         if self.page is None:
             raise RuntimeError("Browser page is not initialized")
         if action.type == ActionType.NAVIGATE:
-            return await self.page.goto(action.url, timeout=action.timeout)
+            resp = await self.page.goto(action.url, timeout=action.timeout)
+            if resp is not None:
+                return {"status": resp.status, "url": resp.url}
+            return None
         if action.type == ActionType.CLICK:
             await self.page.click(action.selector, timeout=action.timeout)
             return None

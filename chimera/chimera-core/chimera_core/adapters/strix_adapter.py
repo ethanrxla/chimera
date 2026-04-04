@@ -147,6 +147,16 @@ class StrixAdapter(AdapterBase):
                 )
         return entries
 
+    def _cleanup_sandbox_container(self, run_name: str) -> None:
+        """Stop and remove the strix Docker sandbox container for this run."""
+        import subprocess
+        container_name = f"strix-scan-{run_name}"
+        try:
+            subprocess.run(["docker", "stop", "--time", "5", container_name], capture_output=True, timeout=15)
+            subprocess.run(["docker", "rm", "--force", container_name], capture_output=True, timeout=10)
+        except Exception:
+            pass
+
     def run(self, targets: List[str]) -> dict:
         live = bool(self.options.get("live", False))
         fixture_path = self.options.get("fixture_path")
@@ -161,13 +171,16 @@ class StrixAdapter(AdapterBase):
             command = self.build_command(targets)
             timeout = self.options.get("timeout_s")
             run_name = f"chimera-{self.run_id}-{self.task_id}"
-            result = self.tool_runner.run(
-                self.id,
-                command,
-                task_id=self.task_id,
-                timeout_s=timeout,
-                cwd=self.strix_root,
-            )
+            try:
+                result = self.tool_runner.run(
+                    self.id,
+                    command,
+                    task_id=self.task_id,
+                    timeout_s=timeout,
+                    cwd=self.strix_root,
+                )
+            finally:
+                self._cleanup_sandbox_container(run_name)
             return_code = _command_return_code(result)
             if return_code not in {0, 2}:
                 error_message = (result.stderr or result.stdout or f"{self.id} exited with code {return_code}").strip()

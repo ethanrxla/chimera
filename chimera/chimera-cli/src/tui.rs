@@ -1,17 +1,23 @@
-use crate::models::{FindingSummary, RunDetail, RunSummary, StatusResponse};
-use crate::render::{render_finding_lines, render_status_block, stat_u64};
+use crate::action::{Action, Effect};
+use crate::app::{App, Mode};
+use crate::events::{Event, EventHandler};
+use crate::models::{FindingSummary, RunDetail, StatusResponse};
+use crate::render::{render_finding_lines, render_status_block};
+use crate::theme::Theme;
+use crate::ui;
 use anyhow::Result;
-use crossterm::event::{self, Event, KeyCode, KeyEventKind};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
 use ratatui::backend::CrosstermBackend;
-use ratatui::layout::{Constraint, Direction, Layout};
+use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap};
 use ratatui::{Frame, Terminal};
+use std::env;
 use std::io::{stdout, IsTerminal};
 use std::time::{Duration, Instant};
 
@@ -26,62 +32,6 @@ pub struct DashboardState {
     pub findings: Vec<FindingSummary>,
 }
 
-#[derive(Debug, Clone)]
-pub struct ConsoleSessionState {
-    pub selected_run_id: Option<String>,
-    pub last_target: Option<String>,
-    pub last_pipeline: String,
-    pub last_program: Option<String>,
-    pub staged_scope_text: Option<String>,
-    pub input: String,
-    pub command_mode: bool,
-    pub logs: Vec<String>,
-}
-
-impl ConsoleSessionState {
-    pub fn new(
-        selected_run_id: Option<String>,
-        last_target: Option<String>,
-        last_pipeline: String,
-        last_program: Option<String>,
-    ) -> Self {
-        Self {
-            selected_run_id,
-            last_target,
-            last_pipeline,
-            last_program,
-            staged_scope_text: None,
-            input: String::new(),
-            command_mode: false,
-            logs: Vec::new(),
-        }
-    }
-
-    pub fn push_log(&mut self, line: impl Into<String>) {
-        self.logs.push(line.into());
-        if self.logs.len() > 120 {
-            let drain = self.logs.len().saturating_sub(120);
-            self.logs.drain(0..drain);
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct ConsoleSnapshot {
-    pub status: StatusResponse,
-    pub runs: Vec<RunSummary>,
-    pub selected_run_id: Option<String>,
-    pub selected_run: Option<RunDetail>,
-    pub events: Vec<String>,
-    pub findings: Vec<FindingSummary>,
-    pub api_error: Option<String>,
-}
-
-pub enum ConsoleDirective<T> {
-    Continue,
-    Exit(ConsoleExit<T>),
-}
-
 pub enum ConsoleExit<T> {
     Quit,
     Action(T),
@@ -91,26 +41,67 @@ pub fn should_use_tui() -> bool {
     stdout().is_terminal()
 }
 
+pub fn run_startup_splash() -> Result<bool> {
+    if !should_use_tui() || !startup_matrix_enabled() {
+        return Ok(true);
+    }
+
+    enable_raw_mode()?;
+    let mut stdout = stdout();
+    execute!(stdout, EnterAlternateScreen)?;
+    let backend = CrosstermBackend::new(stdout);
+    let mut terminal = Terminal::new(backend)?;
+    let mut events = EventHandler::new(Duration::from_millis(90));
+    let theme = Theme::from_name(crate::theme::ThemeName::Matrix);
+    let mut splash = StartupSplash::default();
+
+    let result = loop {
+        terminal.draw(|frame| draw_startup_splash(frame, &mut splash, &theme))?;
+
+        match events.next()? {
+            Event::Tick => {
+                let size = terminal.size()?;
+                splash.tick(size.width, size.height);
+            }
+            Event::Resize => {
+                let size = terminal.size()?;
+                splash.ensure_columns(size.width, size.height);
+            }
+            Event::Key(key) => match key.code {
+                KeyCode::Char('1') | KeyCode::Enter => break Ok(true),
+                KeyCode::Char('?') => splash.show_help = !splash.show_help,
+                KeyCode::Esc | KeyCode::Char('q') => break Ok(false),
+                _ => {}
+            },
+        }
+    };
+
+    disable_raw_mode()?;
+    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    terminal.show_cursor()?;
+    result
+}
+
 pub fn boot_sequence(target: &str, pipeline: &str) -> Result<()> {
     let mut stdout = stdout();
     execute!(
         stdout,
         crossterm::terminal::Clear(crossterm::terminal::ClearType::All)
     )?;
-    let target_line = format!("     [ TARGET ]: {} via {} pipeline", target, pipeline);
+    let target_line = format!("Target: {}   Pipeline: {}", target, pipeline);
     let lines = vec![
-        "--------------------------------------------------[ CHIMERA v1.0 ]--------------------------------------------------",
-        "     [ SYSTEM BOOT ]: Loading Chimera kernel... [ OK ]",
-        "     [ INIT ]: Spawning evidence graph engine... [ OK ]",
-        "     [ ARMORY ]: Deploying validators: BOLA·BFLA·JWT·GraphQL·DOM·LLM [ ONLINE ]",
-        "     [ PROPHET ]: Connecting to Shannon LLM interface... [ RESPONSIVE ]",
-        "     [ BROWSER ]: Initializing Playwright phantoms... [ GHOSTS READY ]",
+        "  ____ _   _ ___ __  __ _____ ____   _",
+        " / ___| | | |_ _|  \\/  | ____|  _ \\ / \\",
+        "| |   | |_| || || |\\/| |  _| | |_) / _ \\",
+        "| |___|  _  || || |  | | |___|  _ < ___ \\",
+        " \\____|_| |_|___|_|  |_|_____|_| \\_\\_/   \\_\\",
+        "",
+        "AI-assisted terminal interface",
         target_line.as_str(),
-        "--------------------------------------------------------------------------------------------------------------------",
     ];
     for line in lines {
         println!("\x1b[32m{}\x1b[0m", line);
-        std::thread::sleep(Duration::from_millis(55));
+        std::thread::sleep(Duration::from_millis(40));
     }
     Ok(())
 }
@@ -128,107 +119,15 @@ where
     execute!(stdout, EnterAlternateScreen)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
+    let theme = Theme::from_name(crate::theme::ThemeName::Matrix);
 
     let result = loop {
         if let Some(state) = fetch()? {
-            terminal.draw(|frame| {
-                let layout = Layout::default()
-                    .direction(Direction::Vertical)
-                    .constraints([
-                        Constraint::Length(5),
-                        Constraint::Min(10),
-                        Constraint::Length(3),
-                    ])
-                    .split(frame.area());
-
-                let top = Layout::default()
-                    .direction(Direction::Horizontal)
-                    .constraints([Constraint::Percentage(52), Constraint::Percentage(48)])
-                    .split(layout[1]);
-
-                let bottom = Layout::default()
-                    .direction(Direction::Horizontal)
-                    .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
-                    .split(top[1]);
-
-                let header = Paragraph::new(vec![
-                    Line::from(vec![
-                        Span::styled(
-                            "CHIMERA@",
-                            Style::default()
-                                .fg(Color::Green)
-                                .add_modifier(Modifier::BOLD),
-                        ),
-                        Span::styled("matrix ", Style::default().fg(Color::Cyan)),
-                        Span::styled(
-                            format!("[ {} ]", state.phase.to_ascii_uppercase()),
-                            Style::default().fg(Color::Yellow),
-                        ),
-                    ]),
-                    Line::from(format!(
-                        "run={} | pipeline={} | target={}",
-                        state.run_id, state.pipeline, state.title
-                    )),
-                    Line::from("q = disconnect | live feed from /v1"),
-                ])
-                .block(
-                    Block::default()
-                        .title("Boot Console")
-                        .borders(Borders::ALL)
-                        .border_style(Style::default().fg(Color::Green)),
-                );
-                frame.render_widget(header, layout[0]);
-
-                let status_lines = render_status_block(&state.status, state.run_detail.as_ref());
-                let status = Paragraph::new(status_lines.join("\n")).block(
-                    Block::default()
-                        .title("Run State")
-                        .borders(Borders::ALL)
-                        .border_style(Style::default().fg(Color::Green)),
-                );
-                frame.render_widget(status, top[0]);
-
-                let event_items: Vec<ListItem> = state
-                    .events
-                    .iter()
-                    .rev()
-                    .take(18)
-                    .map(|item| ListItem::new(item.clone()))
-                    .collect();
-                let events = List::new(event_items).block(
-                    Block::default()
-                        .title("Telemetry Feed")
-                        .borders(Borders::ALL)
-                        .border_style(Style::default().fg(Color::Cyan)),
-                );
-                frame.render_widget(events, bottom[0]);
-
-                let finding_lines = render_finding_lines(
-                    &state.findings,
-                    (bottom[1].width as usize).saturating_sub(6),
-                );
-                let findings = Paragraph::new(finding_lines.join("\n")).block(
-                    Block::default()
-                        .title("Confirmed Surface")
-                        .borders(Borders::ALL)
-                        .border_style(Style::default().fg(Color::Red)),
-                );
-                frame.render_widget(findings, bottom[1]);
-
-                let footer = Paragraph::new(
-                    "Scope-first control surface. Findings and chain artifacts stay replayable.",
-                )
-                .block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .border_style(Style::default().fg(Color::Green)),
-                );
-                frame.render_widget(footer, layout[2]);
-            })?;
+            terminal.draw(|frame| draw_dashboard(frame, &state, &theme))?;
         }
 
-        if event::poll(Duration::from_millis(200))? {
-            if let Event::Key(key) = event::read()? {
+        if crossterm::event::poll(Duration::from_millis(200))? {
+            if let crossterm::event::Event::Key(key) = crossterm::event::read()? {
                 if matches!(key.code, KeyCode::Char('q') | KeyCode::Esc) {
                     break Ok(());
                 }
@@ -242,14 +141,9 @@ where
     result
 }
 
-pub fn run_console<F, E, T>(
-    session: &mut ConsoleSessionState,
-    mut fetch: F,
-    mut execute: E,
-) -> Result<ConsoleExit<T>>
+pub fn run_console<F, T>(app: &mut App, mut handle_effect: F) -> Result<ConsoleExit<T>>
 where
-    F: FnMut(&mut ConsoleSessionState) -> Result<ConsoleSnapshot>,
-    E: FnMut(&str, &ConsoleSnapshot, &mut ConsoleSessionState) -> Result<ConsoleDirective<T>>,
+    F: FnMut(Effect, &mut App) -> Result<Option<ConsoleExit<T>>>,
 {
     if !should_use_tui() {
         return Ok(ConsoleExit::Quit);
@@ -260,92 +154,38 @@ where
     execute!(stdout, EnterAlternateScreen)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
-    let mut snapshot = fetch(session)?;
-    let refresh_interval = Duration::from_millis(750);
-    let mut last_refresh = Instant::now();
+    let mut events = EventHandler::new(Duration::from_millis(250));
+    let mut last_refresh = Instant::now() - Duration::from_secs(1);
 
     let result = loop {
-        terminal.draw(|frame| draw_console(frame, &snapshot, session))?;
-
-        if last_refresh.elapsed() >= refresh_interval {
-            match fetch(session) {
-                Ok(updated) => snapshot = updated,
-                Err(err) => session.push_log(format!("refresh failed: {err:#}")),
+        if last_refresh.elapsed() >= Duration::from_millis(900) {
+            if let Some(exit) = dispatch(app, Action::Refresh, &mut handle_effect)? {
+                break Ok(exit);
             }
             last_refresh = Instant::now();
         }
 
-        if !event::poll(Duration::from_millis(100))? {
-            continue;
+        let theme = Theme::from_name(app.theme);
+        terminal.draw(|frame| ui::draw(frame, app, &theme))?;
+
+        if !app.running {
+            break Ok(ConsoleExit::Quit);
         }
 
-        let Event::Key(key) = event::read()? else {
-            continue;
-        };
-
-        if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
-            continue;
-        }
-
-        if session.command_mode {
-            match key.code {
-                KeyCode::Esc => {
-                    session.command_mode = false;
-                    session.input.clear();
+        match events.next()? {
+            Event::Tick => {
+                if let Some(exit) = dispatch(app, Action::Tick, &mut handle_effect)? {
+                    break Ok(exit);
                 }
-                KeyCode::Enter => {
-                    let command = session.input.trim().to_string();
-                    session.command_mode = false;
-                    session.input.clear();
-                    if command.is_empty() {
-                        continue;
-                    }
-                    match execute(&command, &snapshot, session)? {
-                        ConsoleDirective::Continue => {
-                            snapshot = fetch(session)?;
-                            last_refresh = Instant::now();
-                        }
-                        ConsoleDirective::Exit(exit) => break Ok(exit),
+            }
+            Event::Resize => {}
+            Event::Key(key) => {
+                if let Some(action) = map_key_event(app.mode, key) {
+                    if let Some(exit) = dispatch(app, action, &mut handle_effect)? {
+                        break Ok(exit);
                     }
                 }
-                KeyCode::Backspace => {
-                    session.input.pop();
-                }
-                KeyCode::Char(ch) => session.input.push(ch),
-                KeyCode::Tab => session.input.push(' '),
-                _ => {}
             }
-            continue;
-        }
-
-        match key.code {
-            KeyCode::Char('q') | KeyCode::Esc => break Ok(ConsoleExit::Quit),
-            KeyCode::Char(':') | KeyCode::Char('/') => {
-                session.command_mode = true;
-            }
-            KeyCode::Char('s') => {
-                session.command_mode = true;
-                session.input = "run".to_string();
-            }
-            KeyCode::Char('r') => {
-                snapshot = fetch(session)?;
-                last_refresh = Instant::now();
-                session.push_log("console refreshed");
-            }
-            KeyCode::Char('j') | KeyCode::Down => {
-                cycle_selection(session, &snapshot.runs, 1);
-            }
-            KeyCode::Char('k') | KeyCode::Up => {
-                cycle_selection(session, &snapshot.runs, -1);
-            }
-            KeyCode::Enter => {
-                if let Some(run_id) = session.selected_run_id.clone() {
-                    session.push_log(format!("focused run {}", abbreviate(&run_id, 18)));
-                    snapshot = fetch(session)?;
-                    last_refresh = Instant::now();
-                }
-            }
-            _ => {}
         }
     };
 
@@ -355,300 +195,408 @@ where
     result
 }
 
-fn draw_console(frame: &mut Frame, snapshot: &ConsoleSnapshot, session: &ConsoleSessionState) {
+fn dispatch<T, F>(
+    app: &mut App,
+    action: Action,
+    handle_effect: &mut F,
+) -> Result<Option<ConsoleExit<T>>>
+where
+    F: FnMut(Effect, &mut App) -> Result<Option<ConsoleExit<T>>>,
+{
+    let effects = app.update(action)?;
+    for effect in effects {
+        if let Some(exit) = handle_effect(effect, app)? {
+            return Ok(Some(exit));
+        }
+    }
+    Ok(None)
+}
+
+fn map_key_event(mode: Mode, key: KeyEvent) -> Option<Action> {
+    if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('c')) {
+        return Some(Action::Quit);
+    }
+
+    match mode {
+        Mode::Help => match key.code {
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('?') => Some(Action::HideHelp),
+            _ => None,
+        },
+        Mode::Command | Mode::Nlp => match key.code {
+            KeyCode::Esc => Some(Action::ExitInputMode),
+            KeyCode::Enter => Some(Action::SubmitInput),
+            KeyCode::Backspace => Some(Action::PopInput),
+            KeyCode::Up => Some(Action::HistoryPrev),
+            KeyCode::Down => Some(Action::HistoryNext),
+            KeyCode::Char('?') => Some(Action::ShowHelp),
+            KeyCode::Tab => Some(Action::PushInput(' ')),
+            KeyCode::Char(ch) => Some(Action::PushInput(ch)),
+            _ => None,
+        },
+        Mode::Normal => match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => Some(Action::Back),
+            KeyCode::Char('?') => Some(Action::ShowHelp),
+            KeyCode::Char(':') => Some(Action::EnterCommandMode(None)),
+            KeyCode::Char('/') => Some(Action::EnterNlpMode),
+            KeyCode::Tab | KeyCode::Right => Some(Action::FocusNext),
+            KeyCode::BackTab | KeyCode::Left => Some(Action::FocusPrev),
+            KeyCode::Char('j') | KeyCode::Down => Some(Action::MoveDown),
+            KeyCode::Char('k') | KeyCode::Up => Some(Action::MoveUp),
+            KeyCode::Char('r') => Some(Action::Refresh),
+            KeyCode::Enter => Some(Action::Select),
+            _ => None,
+        },
+    }
+}
+
+fn draw_dashboard(frame: &mut Frame, state: &DashboardState, theme: &Theme) {
     let layout = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(5),
-            Constraint::Min(12),
-            Constraint::Length(7),
-            Constraint::Length(3),
+            Constraint::Min(10),
+            Constraint::Length(2),
         ])
         .split(frame.area());
 
     let body = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage(31),
-            Constraint::Percentage(34),
-            Constraint::Percentage(35),
-        ])
+        .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
         .split(layout[1]);
-
-    let center = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(9), Constraint::Min(8)])
-        .split(body[1]);
 
     let right = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Percentage(46), Constraint::Percentage(54)])
-        .split(body[2]);
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(body[1]);
 
-    let scope_mode = if session.staged_scope_text.is_some() {
-        "manifest staged"
-    } else {
-        "target scoped"
-    };
-    let selected_label = snapshot
-        .selected_run_id
-        .as_ref()
-        .map(|run_id| abbreviate(run_id, 20))
-        .unwrap_or_else(|| "none".to_string());
     let header = Paragraph::new(vec![
         Line::from(vec![
             Span::styled(
                 "CHIMERA ",
                 Style::default()
-                    .fg(Color::Green)
+                    .fg(theme.accent)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::styled("console", Style::default().fg(Color::Cyan)),
-            Span::styled(
-                format!(
-                    " [{}]",
-                    if snapshot.api_error.is_some() {
-                        "DEGRADED"
-                    } else {
-                        "ONLINE"
-                    }
-                ),
-                Style::default().fg(if snapshot.api_error.is_some() {
-                    Color::Red
-                } else {
-                    Color::Yellow
-                }),
-            ),
+            Span::styled("// Live Monitor", Style::default().fg(theme.text)),
         ]),
         Line::from(format!(
-            "target={} | pipeline={} | scope={} | run={}",
-            session.last_target.as_deref().unwrap_or("unset"),
-            session.last_pipeline,
-            scope_mode,
-            selected_label
+            "run={}   pipeline={}   target={}",
+            state.run_id, state.pipeline, state.title
         )),
-        Line::from(format!(
-            "mode={} | active={} | : command | s run | j/k select | q quit",
-            snapshot.status.mode,
-            snapshot
-                .status
-                .active_run
-                .as_ref()
-                .and_then(|run| run.run_id.as_deref())
-                .map(|run_id| abbreviate(run_id, 18))
-                .unwrap_or_else(|| "none".to_string())
-        )),
+        Line::from(format!("phase={}   q=disconnect", state.phase)),
     ])
     .block(
         Block::default()
-            .title("Operator Console")
+            .title("Run Monitor")
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Green)),
-    )
-    .wrap(Wrap { trim: true });
+            .border_style(Style::default().fg(theme.accent)),
+    );
     frame.render_widget(header, layout[0]);
 
-    let run_items: Vec<ListItem> = if snapshot.runs.is_empty() {
-        vec![ListItem::new("No runs recorded")]
-    } else {
-        snapshot
-            .runs
-            .iter()
-            .take(14)
-            .map(|run| {
-                let findings = stat_u64(&run.stats, "findings_total");
-                let chains = stat_u64(&run.stats, "exploit_chains");
-                ListItem::new(format!(
-                    "{}  {:<10} f={} c={}",
-                    abbreviate(&run.run_id, 14),
-                    run.status,
-                    findings,
-                    chains
-                ))
-            })
-            .collect()
-    };
-    let mut run_state = ListState::default();
-    run_state.select(selected_run_index(snapshot));
-    let run_list = List::new(run_items)
+    let status_lines = render_status_block(&state.status, state.run_detail.as_ref());
+    let status = Paragraph::new(status_lines.join("\n"))
         .block(
             Block::default()
-                .title("Recent Runs")
+                .title("Run State")
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Cyan)),
-        )
-        .highlight_style(
-            Style::default()
-                .fg(Color::Black)
-                .bg(Color::Green)
-                .add_modifier(Modifier::BOLD),
-        )
-        .highlight_symbol(">> ");
-    frame.render_stateful_widget(run_list, body[0], &mut run_state);
-
-    let mut status_lines = render_status_block(&snapshot.status, snapshot.selected_run.as_ref());
-    if let Some(err) = snapshot.api_error.as_ref() {
-        status_lines.push(String::new());
-        status_lines.push(format!("API: {}", err));
-    }
-    let status_panel = Paragraph::new(status_lines.join("\n"))
-        .block(
-            Block::default()
-                .title("Status")
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Green)),
+                .border_style(Style::default().fg(theme.accent_alt)),
         )
         .wrap(Wrap { trim: true });
-    frame.render_widget(status_panel, center[0]);
+    frame.render_widget(status, body[0]);
 
-    let run_detail_lines = selected_run_lines(snapshot);
-    let selected_panel = Paragraph::new(run_detail_lines.join("\n"))
-        .block(
-            Block::default()
-                .title("Run Context")
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Yellow)),
-        )
-        .wrap(Wrap { trim: true });
-    frame.render_widget(selected_panel, center[1]);
-
-    let event_items: Vec<ListItem> = if snapshot.events.is_empty() {
-        vec![ListItem::new("No telemetry yet")]
-    } else {
-        snapshot
-            .events
-            .iter()
-            .rev()
-            .take(12)
-            .map(|line| {
-                ListItem::new(abbreviate(
-                    line,
-                    (right[0].width as usize).saturating_sub(6),
-                ))
-            })
-            .collect()
-    };
-    let event_panel = List::new(event_items).block(
+    let event_items = state
+        .events
+        .iter()
+        .rev()
+        .take(16)
+        .map(|line| ListItem::new(line.clone()))
+        .collect::<Vec<_>>();
+    let events = List::new(event_items).block(
         Block::default()
             .title("Telemetry")
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Magenta)),
+            .border_style(Style::default().fg(theme.accent)),
     );
-    frame.render_widget(event_panel, right[0]);
+    frame.render_widget(events, right[0]);
 
-    let finding_lines = render_finding_lines(
-        &snapshot.findings,
-        (right[1].width as usize).saturating_sub(6),
-    );
-    let findings_panel = Paragraph::new(finding_lines.join("\n"))
-        .block(
-            Block::default()
-                .title("Confirmed Findings")
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Red)),
-        )
-        .wrap(Wrap { trim: true });
-    frame.render_widget(findings_panel, right[1]);
-
-    let mut log_lines: Vec<String> = session.logs.iter().rev().take(5).cloned().collect();
-    log_lines.reverse();
-    if log_lines.is_empty() {
-        log_lines.push("Type :help for console commands.".to_string());
-    }
-    let log_panel = Paragraph::new(log_lines.join("\n"))
-        .block(
-            Block::default()
-                .title("Command Log")
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Blue)),
-        )
-        .wrap(Wrap { trim: true });
-    frame.render_widget(log_panel, layout[2]);
-
-    let prompt_text = if session.command_mode {
-        format!("chimera> {}", session.input)
-    } else {
-        "navigation mode | press : to enter a command".to_string()
-    };
-    let prompt = Paragraph::new(prompt_text).block(
+    let findings = Paragraph::new(
+        render_finding_lines(&state.findings, (right[1].width as usize).saturating_sub(6))
+            .join("\n"),
+    )
+    .block(
         Block::default()
-            .title(if session.command_mode {
-                "Prompt"
-            } else {
-                "Ready"
-            })
+            .title("Confirmed Findings")
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Green)),
+            .border_style(Style::default().fg(Color::Red)),
+    )
+    .wrap(Wrap { trim: true });
+    frame.render_widget(findings, right[1]);
+
+    let footer = Paragraph::new("Live scan monitor active. Findings remain replayable.").block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(theme.muted)),
     );
-    frame.render_widget(prompt, layout[3]);
+    frame.render_widget(footer, layout[2]);
 }
 
-fn selected_run_lines(snapshot: &ConsoleSnapshot) -> Vec<String> {
-    let Some(run) = snapshot.selected_run.as_ref() else {
-        return vec![
-            "No run selected".to_string(),
-            "Use j/k or `use <run_id>` to focus a run.".to_string(),
-        ];
-    };
+const MATRIX_CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789@#$%&*!?<>/\\[]{}|=+-_";
+const BIG_SPLASH_LOGO: &[&str] = &[
+    " ██████╗██╗  ██╗██╗███╗   ███╗███████╗██████╗  █████╗ ",
+    "██╔════╝██║  ██║██║████╗ ████║██╔════╝██╔══██╗██╔══██╗",
+    "██║     ███████║██║██╔████╔██║█████╗  ██████╔╝███████║",
+    "██║     ██╔══██║██║██║╚██╔╝██║██╔══╝  ██╔══██╗██╔══██║",
+    "╚██████╗██║  ██║██║██║ ╚═╝ ██║███████╗██║  ██║██║  ██║",
+    " ╚═════╝╚═╝  ╚═╝╚═╝╚═╝     ╚═╝╚══════╝╚═╝  ╚═╝╚═╝  ╚═╝",
+];
+const SMALL_SPLASH_LOGO: &[&str] = &[
+    "  ____ _   _ ___ __  __ _____ ____   _",
+    " / ___| | | |_ _|  \\/  | ____|  _ \\ / \\",
+    "| |   | |_| || || |\\/| |  _| | |_) / _ \\",
+    "| |___|  _  || || |  | | |___|  _ < ___ \\",
+    " \\____|_| |_|___|_|  |_|_____|_| \\_\\_/   \\_\\",
+];
 
-    let findings = stat_u64(&run.stats, "findings_total");
-    let chains = stat_u64(&run.stats, "exploit_chains");
-    vec![
-        format!(
-            "Run ID: {}",
-            run.run_id
-                .as_deref()
-                .map(|run_id| abbreviate(run_id, 24))
-                .unwrap_or_else(|| "unknown".to_string())
-        ),
-        format!("Status: {}", run.status.as_deref().unwrap_or("unknown")),
-        format!("Findings: {} | Chains: {}", findings, chains),
-        format!("Started: {}", run.started_at.as_deref().unwrap_or("n/a")),
-        format!("Ended: {}", run.ended_at.as_deref().unwrap_or("n/a")),
-        format!(
-            "Artifacts: {}",
-            run.artifacts_dir.as_deref().unwrap_or("n/a")
-        ),
-    ]
+#[derive(Debug, Clone)]
+struct RainColumn {
+    head: i16,
+    length: u16,
+    speed: u16,
 }
 
-fn selected_run_index(snapshot: &ConsoleSnapshot) -> Option<usize> {
-    let Some(selected) = snapshot.selected_run_id.as_ref() else {
-        return None;
-    };
-    snapshot
-        .runs
-        .iter()
-        .take(14)
-        .position(|run| &run.run_id == selected)
+#[derive(Debug, Clone)]
+struct StartupSplash {
+    seed: u64,
+    frame: u64,
+    columns: Vec<RainColumn>,
+    show_help: bool,
 }
 
-fn cycle_selection(session: &mut ConsoleSessionState, runs: &[RunSummary], delta: isize) {
-    if runs.is_empty() {
-        return;
+impl Default for StartupSplash {
+    fn default() -> Self {
+        Self {
+            seed: 0xC0FFEE_5EED_u64,
+            frame: 0,
+            columns: Vec::new(),
+            show_help: false,
+        }
+    }
+}
+
+impl StartupSplash {
+    fn ensure_columns(&mut self, width: u16, height: u16) {
+        if self.columns.len() == width as usize {
+            return;
+        }
+
+        self.columns = (0..width)
+            .map(|index| self.make_column(index as usize, height))
+            .collect();
     }
 
-    let current = session
-        .selected_run_id
-        .as_ref()
-        .and_then(|run_id| runs.iter().position(|run| &run.run_id == run_id))
-        .unwrap_or(0);
+    fn tick(&mut self, width: u16, height: u16) {
+        self.frame = self.frame.wrapping_add(1);
+        self.ensure_columns(width, height);
 
-    let next = if delta.is_negative() {
-        current
-            .checked_sub(delta.unsigned_abs())
-            .unwrap_or(runs.len() - 1)
+        for idx in 0..self.columns.len() {
+            let speed = self.columns[idx].speed.max(1) as u64;
+            if !(self.frame + idx as u64).is_multiple_of(speed) {
+                continue;
+            }
+
+            self.columns[idx].head += 1;
+            if self.columns[idx].head - self.columns[idx].length as i16 > height as i16 {
+                self.columns[idx] = self.make_column(idx, height);
+            }
+        }
+    }
+
+    fn make_column(&mut self, offset: usize, height: u16) -> RainColumn {
+        let height = height.max(10) as i16;
+        RainColumn {
+            head: -((self.next_u32() as i16 % height) + (offset as i16 % 7)),
+            length: 6 + (self.next_u32() % 12) as u16,
+            speed: 1 + (self.next_u32() % 4) as u16,
+        }
+    }
+
+    fn next_u32(&mut self) -> u32 {
+        self.seed ^= self.seed << 13;
+        self.seed ^= self.seed >> 7;
+        self.seed ^= self.seed << 17;
+        self.seed as u32
+    }
+
+    fn glyph(&self, x: u16, y: u16) -> char {
+        let idx = ((x as usize * 31) + (y as usize * 17) + (self.frame as usize * 13))
+            % MATRIX_CHARS.len();
+        MATRIX_CHARS[idx] as char
+    }
+}
+
+fn startup_matrix_enabled() -> bool {
+    !matches!(
+        env::var("CHIMERA_MATRIX")
+            .unwrap_or_else(|_| "1".to_string())
+            .to_ascii_lowercase()
+            .as_str(),
+        "0" | "false" | "no"
+    )
+}
+
+fn draw_startup_splash(frame: &mut Frame, splash: &mut StartupSplash, theme: &Theme) {
+    let area = frame.area();
+    splash.ensure_columns(area.width, area.height);
+
+    let mut lines = Vec::with_capacity(area.height as usize);
+    for y in 0..area.height {
+        let mut spans = Vec::with_capacity(area.width as usize);
+        for x in 0..area.width {
+            let column = &splash.columns[x as usize];
+            let head = column.head;
+            let row = y as i16;
+            if row <= head && row > head - column.length as i16 {
+                let distance = (head - row) as u16;
+                let color = match distance {
+                    0 => Color::White,
+                    1..=2 => theme.accent,
+                    3..=5 => theme.accent_alt,
+                    _ => theme.muted,
+                };
+                spans.push(Span::styled(
+                    splash.glyph(x, y).to_string(),
+                    Style::default().fg(color),
+                ));
+            } else {
+                spans.push(Span::styled(" ", Style::default().bg(Color::Black)));
+            }
+        }
+        lines.push(Line::from(spans));
+    }
+    frame.render_widget(Paragraph::new(lines), area);
+
+    let card = centered_rect(84, 56, area);
+    frame.render_widget(Clear, card);
+    frame.render_widget(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(theme.panel_alt)),
+        card,
+    );
+
+    let inner = Rect {
+        x: card.x.saturating_add(2),
+        y: card.y.saturating_add(1),
+        width: card.width.saturating_sub(4),
+        height: card.height.saturating_sub(2),
+    };
+
+    let logo = if inner.width >= 68 {
+        BIG_SPLASH_LOGO
     } else {
-        (current + delta as usize) % runs.len()
+        SMALL_SPLASH_LOGO
     };
+    render_logo_layer(
+        frame,
+        shifted_rect(inner, 2, 1),
+        logo,
+        Style::default().fg(theme.muted),
+    );
+    render_logo_layer(
+        frame,
+        shifted_rect(inner, 1, 0),
+        logo,
+        Style::default().fg(theme.accent_alt),
+    );
+    render_logo_layer(
+        frame,
+        inner,
+        logo,
+        Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
+    );
 
-    session.selected_run_id = Some(runs[next].run_id.clone());
+    let subtitle_y = inner.y.saturating_add(logo.len() as u16).saturating_add(1);
+    let subtitle_area = Rect {
+        x: inner.x,
+        y: subtitle_y,
+        width: inner.width,
+        height: 3,
+    };
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::from(Span::styled(
+                "AI-assisted terminal interface",
+                Style::default().fg(theme.text),
+            )),
+            Line::from(Span::styled(
+                "[1] Continue   [Enter] Continue   [?] Help   [q] Quit",
+                Style::default().fg(theme.accent),
+            )),
+        ]),
+        subtitle_area,
+    );
+
+    if splash.show_help {
+        let help = centered_rect(48, 34, area);
+        frame.render_widget(Clear, help);
+        frame.render_widget(
+            Paragraph::new(vec![
+                Line::from(Span::styled(
+                    "Startup",
+                    Style::default()
+                        .fg(theme.accent)
+                        .add_modifier(Modifier::BOLD),
+                )),
+                Line::from("1 or Enter opens the Chimera operator console."),
+                Line::from("? toggles this help."),
+                Line::from("q or Esc exits before the console loads."),
+                Line::from("Set CHIMERA_MATRIX=0 to skip this startup splash."),
+            ])
+            .block(
+                Block::default()
+                    .title("Help")
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(theme.accent_alt)),
+            )
+            .wrap(Wrap { trim: true }),
+            help,
+        );
+    }
 }
 
-fn abbreviate(value: &str, width: usize) -> String {
-    if value.len() <= width {
-        return value.to_string();
+fn render_logo_layer(frame: &mut Frame, area: Rect, logo: &[&str], style: Style) {
+    let lines = logo
+        .iter()
+        .map(|line| Line::from(Span::styled((*line).to_string(), style)))
+        .collect::<Vec<_>>();
+    frame.render_widget(Paragraph::new(lines), area);
+}
+
+fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
+    let popup_layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage((100 - percent_y) / 2),
+            Constraint::Percentage(percent_y),
+            Constraint::Percentage((100 - percent_y) / 2),
+        ])
+        .split(area);
+
+    Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage((100 - percent_x) / 2),
+            Constraint::Percentage(percent_x),
+            Constraint::Percentage((100 - percent_x) / 2),
+        ])
+        .split(popup_layout[1])[1]
+}
+
+fn shifted_rect(area: Rect, dx: u16, dy: u16) -> Rect {
+    Rect {
+        x: area.x.saturating_add(dx),
+        y: area.y.saturating_add(dy),
+        width: area.width.saturating_sub(dx),
+        height: area.height.saturating_sub(dy),
     }
-    let keep = width.saturating_sub(3);
-    format!("{}...", &value[..keep])
 }

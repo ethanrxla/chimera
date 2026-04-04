@@ -1,22 +1,28 @@
+mod action;
 mod api;
+mod app;
+mod command_parser;
 mod config;
-mod console;
+mod events;
 mod models;
+mod nlp;
 mod render;
+mod theme;
 mod tui;
+mod ui;
 
+use crate::action::{Action, Effect};
 use crate::api::ApiClient;
-use crate::config::{
-    build_scope_manifest_text, build_scope_text, load_state, read_scope_file, save_state,
-};
-use crate::console::{command_help, parse_console_command, ConsoleCommand};
+use crate::app::{App, ConsoleSnapshot};
+use crate::config::{build_scope_text, load_state, read_scope_file, save_state};
 use crate::models::{
     default_api_base, ChainFinding, CliState, FindingSummary, SafetyState, StatusResponse,
 };
+use crate::nlp::interpret_payload;
 use crate::render::{render_chain_ascii, render_chain_detail, render_status_block, stat_u64};
 use crate::tui::{
-    boot_sequence, run_console, run_dashboard, should_use_tui, ConsoleDirective, ConsoleExit,
-    ConsoleSessionState, ConsoleSnapshot, DashboardState,
+    boot_sequence, run_console, run_dashboard, run_startup_splash, should_use_tui, ConsoleExit,
+    DashboardState,
 };
 use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
@@ -289,7 +295,11 @@ async fn run_console_shell(
     api_base: &str,
     cli: &Cli,
 ) -> Result<()> {
-    let mut session = ConsoleSessionState::new(
+    if !run_startup_splash()? {
+        return Ok(());
+    }
+
+    let mut app = App::new(
         state.last_run_id.clone(),
         state.last_target.clone(),
         state
@@ -298,40 +308,28 @@ async fn run_console_shell(
             .unwrap_or_else(|| cli.pipeline.as_api_value().to_string()),
         state.last_program.clone(),
     );
-    session.push_log("msfconsole-style control surface online");
-    session.push_log("type :help to stage targets, ask Shannon, or launch scans");
+    app.push_output("Hybrid operator console online.");
+    app.push_output("Normal mode handles navigation. Use : for commands and / for NLP.");
+    app.set_status("Ready", false);
 
     loop {
-        let exit = run_console(
-            &mut session,
-            |session| fetch_console_snapshot(client, state, session),
-            |input, snapshot, session| {
-                execute_console_command(client, state, input, snapshot, session)
-            },
-        )?;
+        let exit = run_console(&mut app, |effect, app| {
+            handle_console_effect(client, state, app, effect)
+        })?;
 
         match exit {
             ConsoleExit::Quit => break,
             ConsoleExit::Action(invocation) => {
                 match run_scan_invocation(client, state, api_base, cli, invocation).await {
                     Ok((run_id, findings)) => {
-                        session.selected_run_id = Some(run_id.clone());
-                        session.push_log(format!(
-                            "run {} completed with {} findings",
-                            run_id,
-                            findings.len()
-                        ));
-                        for item in findings.iter().take(3) {
-                            session.push_log(format!(
-                                "[{}] {} ({:.2})",
-                                item.severity.to_uppercase(),
-                                item.title,
-                                item.confidence
-                            ));
-                        }
+                        app.selected_run_id = Some(run_id.clone());
+                        app.push_output(format!("run {} completed", run_id));
+                        app.append_findings_preview(&run_id, &findings);
+                        app.set_status("Run completed", false);
                     }
                     Err(err) => {
-                        session.push_log(format!("scan failed: {err:#}"));
+                        app.push_output(format!("scan failed: {err:#}"));
+                        app.set_status("Scan failed", true);
                     }
                 }
             }
@@ -339,13 +337,13 @@ async fn run_console_shell(
     }
 
     state.api_base = api_base.to_string();
-    state.last_target = session.last_target.clone();
-    state.last_run_id = session
+    state.last_target = app.target.clone();
+    state.last_run_id = app
         .selected_run_id
         .clone()
         .or_else(|| state.last_run_id.clone());
-    state.last_pipeline = Some(session.last_pipeline.clone());
-    state.last_program = session.last_program.clone();
+    state.last_pipeline = Some(app.pipeline.clone());
+    state.last_program = app.program.clone();
     save_state(state)?;
 
     Ok(())
@@ -396,7 +394,7 @@ async fn run_scan_invocation(
 fn fetch_console_snapshot(
     client: &ApiClient,
     state: &CliState,
-    session: &mut ConsoleSessionState,
+    selected_run_id: Option<String>,
 ) -> Result<ConsoleSnapshot> {
     tokio::task::block_in_place(|| {
         let handle = tokio::runtime::Handle::current();
@@ -406,7 +404,7 @@ fn fetch_console_snapshot(
                 return Ok(ConsoleSnapshot {
                     status: offline_status(&err.to_string()),
                     runs: Vec::new(),
-                    selected_run_id: session.selected_run_id.clone(),
+                    selected_run_id,
                     selected_run: None,
                     events: Vec::new(),
                     findings: Vec::new(),
@@ -424,9 +422,7 @@ fn fetch_console_snapshot(
             }
         };
 
-        let selected_run_id = session
-            .selected_run_id
-            .clone()
+        let selected_run_id = selected_run_id
             .or_else(|| {
                 status
                     .active_run
@@ -435,7 +431,6 @@ fn fetch_console_snapshot(
             })
             .or_else(|| state.last_run_id.clone())
             .or_else(|| runs.first().map(|run| run.run_id.clone()));
-        session.selected_run_id = selected_run_id.clone();
 
         let selected_run = if let Some(run_id) = selected_run_id.as_ref() {
             match handle.block_on(client.get_run(run_id)) {
@@ -480,275 +475,114 @@ fn fetch_console_snapshot(
     })
 }
 
-fn execute_console_command(
+fn handle_console_effect(
     client: &ApiClient,
     state: &CliState,
-    input: &str,
-    snapshot: &ConsoleSnapshot,
-    session: &mut ConsoleSessionState,
-) -> Result<ConsoleDirective<ScanInvocation>> {
-    let command = parse_console_command(input)?;
-    match command {
-        ConsoleCommand::Help => {
-            for line in command_help() {
-                session.push_log(*line);
-            }
-            Ok(ConsoleDirective::Continue)
-        }
-        ConsoleCommand::Info => {
-            session.push_log(format!(
-                "target={} | pipeline={} | program={} | scope={}",
-                session.last_target.as_deref().unwrap_or("unset"),
-                session.last_pipeline,
-                session.last_program.as_deref().unwrap_or("unset"),
-                if session.staged_scope_text.is_some() {
-                    "staged"
-                } else {
-                    "generated"
+    app: &mut App,
+    effect: Effect,
+) -> Result<Option<ConsoleExit<ScanInvocation>>> {
+    match effect {
+        Effect::RefreshSnapshot => {
+            match fetch_console_snapshot(client, state, app.selected_run_id.clone()) {
+                Ok(snapshot) => {
+                    app.update(Action::SnapshotLoaded(snapshot))?;
                 }
-            ));
-            Ok(ConsoleDirective::Continue)
-        }
-        ConsoleCommand::Refresh => {
-            session.push_log("refresh requested");
-            Ok(ConsoleDirective::Continue)
-        }
-        ConsoleCommand::Quit => Ok(ConsoleDirective::Exit(ConsoleExit::Quit)),
-        ConsoleCommand::ShowStatus => {
-            for line in render_status_block(&snapshot.status, snapshot.selected_run.as_ref()) {
-                session.push_log(line);
-            }
-            Ok(ConsoleDirective::Continue)
-        }
-        ConsoleCommand::ShowRuns => {
-            if snapshot.runs.is_empty() {
-                session.push_log("no runs available");
-            } else {
-                for run in snapshot.runs.iter().take(6) {
-                    session.push_log(format!(
-                        "{}  {:<10} findings={} chains={}",
-                        run.run_id,
-                        run.status,
-                        stat_u64(&run.stats, "findings_total"),
-                        stat_u64(&run.stats, "exploit_chains")
-                    ));
+                Err(err) => {
+                    app.update(Action::SnapshotFailed(err.to_string()))?;
                 }
             }
-            Ok(ConsoleDirective::Continue)
+            Ok(None)
         }
-        ConsoleCommand::ShowFindings(run_arg) => {
-            let run_id = resolve_console_run_id(run_arg, snapshot, state)?;
+        Effect::FetchFindings(run_arg) => {
+            let run_id = resolve_console_run_id(run_arg, &app.snapshot, state)?;
             let findings = tokio::task::block_in_place(|| {
                 let handle = tokio::runtime::Handle::current();
                 handle.block_on(client.findings(&run_id))
             })?;
-            session.selected_run_id = Some(run_id.clone());
-            append_findings_preview(session, &run_id, &findings);
-            Ok(ConsoleDirective::Continue)
+            app.selected_run_id = Some(run_id.clone());
+            app.append_findings_preview(&run_id, &findings);
+            Ok(None)
         }
-        ConsoleCommand::UseRun(run_arg) => {
-            let run_id = resolve_run_from_snapshot(&snapshot.runs, &run_arg)
-                .map(|run| run.run_id.clone())
-                .unwrap_or(run_arg);
-            session.selected_run_id = Some(run_id.clone());
-            session.push_log(format!("selected run {}", run_id));
-            Ok(ConsoleDirective::Continue)
-        }
-        ConsoleCommand::SetTarget(target) => {
-            session.last_target = Some(target.clone());
-            session.staged_scope_text = None;
-            session.push_log(format!("staged target {}", target));
-            Ok(ConsoleDirective::Continue)
-        }
-        ConsoleCommand::SetPipeline(pipeline) => {
-            session.last_pipeline = pipeline.clone();
-            session.push_log(format!("pipeline set to {}", pipeline));
-            Ok(ConsoleDirective::Continue)
-        }
-        ConsoleCommand::SetProgram(program) => {
-            session.last_program = Some(program.clone());
-            session.push_log(format!("program label set to {}", program));
-            Ok(ConsoleDirective::Continue)
-        }
-        ConsoleCommand::ClearProgram => {
-            session.last_program = None;
-            session.push_log("cleared program label");
-            Ok(ConsoleDirective::Continue)
-        }
-        ConsoleCommand::ClearScope => {
-            session.staged_scope_text = None;
-            session.push_log("cleared staged scope manifest");
-            Ok(ConsoleDirective::Continue)
-        }
-        ConsoleCommand::LaunchScan { target, pipeline } => {
-            if let Some(target) = target {
-                session.last_target = Some(target);
-                session.staged_scope_text = None;
-            }
-            if let Some(pipeline) = pipeline {
-                session.last_pipeline = pipeline;
-            }
-
-            let scope_text = if let Some(scope_text) = session.staged_scope_text.clone() {
-                scope_text
-            } else {
-                let target = session
-                    .last_target
-                    .as_deref()
-                    .ok_or_else(|| anyhow!("run requires a staged target or scope manifest"))?;
-                build_scope_text(target)?
-            };
-            let title = session
-                .last_target
-                .clone()
-                .unwrap_or_else(|| "scope manifest".to_string());
-            session.push_log(format!("launching {} via {}", title, session.last_pipeline));
-            Ok(ConsoleDirective::Exit(ConsoleExit::Action(
-                ScanInvocation {
-                    title,
-                    primary_target: session.last_target.clone(),
-                    scope_text,
-                    pipeline: session.last_pipeline.clone(),
-                    program: session.last_program.clone(),
-                    remember: true,
-                    scope_file: None,
-                },
-            )))
-        }
-        ConsoleCommand::Oracle(question) => {
-            let target = session.last_target.as_deref();
+        Effect::FetchOracle(question) => {
+            let target = app.target.as_deref();
             let payload = tokio::task::block_in_place(|| {
                 let handle = tokio::runtime::Handle::current();
                 handle.block_on(client.shannon_oracle(&question, target))
             })?;
-            append_oracle_preview(session, &payload);
-            Ok(ConsoleDirective::Continue)
+            append_oracle_preview(app, &payload);
+            Ok(None)
         }
-        ConsoleCommand::NaturalLanguage(text) => {
-            stage_interpreted_input(client, session, snapshot, &text)?;
-            Ok(ConsoleDirective::Continue)
+        Effect::InterpretNlp(text) => {
+            let payload = tokio::task::block_in_place(|| {
+                let handle = tokio::runtime::Handle::current();
+                handle.block_on(client.interpret_input(&text))
+            })?;
+            let resolution = interpret_payload(&payload, &text)?;
+            if let Some(preview) = resolution.preview {
+                apply_app_action(client, state, app, Action::PreviewIntent(preview))?;
+            }
+            if !resolution.notes.is_empty() {
+                apply_app_action(client, state, app, Action::AddOutputs(resolution.notes))?;
+            }
+            for action in resolution.actions {
+                if let Some(exit) = apply_app_action(client, state, app, action)? {
+                    return Ok(Some(exit));
+                }
+            }
+            Ok(None)
+        }
+        Effect::LaunchScan => {
+            let invocation = build_scan_invocation_from_app(app)?;
+            Ok(Some(ConsoleExit::Action(invocation)))
         }
     }
 }
 
-fn stage_interpreted_input(
+fn apply_app_action(
     client: &ApiClient,
-    session: &mut ConsoleSessionState,
-    snapshot: &ConsoleSnapshot,
-    text: &str,
-) -> Result<()> {
-    let parsed = tokio::task::block_in_place(|| {
-        let handle = tokio::runtime::Handle::current();
-        handle.block_on(client.interpret_input(text))
-    })?;
-
-    if let Some(notes) = parsed.get("notes").and_then(Value::as_array) {
-        for note in notes.iter().filter_map(Value::as_str).take(3) {
-            session.push_log(note.to_string());
+    state: &CliState,
+    app: &mut App,
+    action: Action,
+) -> Result<Option<ConsoleExit<ScanInvocation>>> {
+    let effects = app.update(action)?;
+    for effect in effects {
+        if let Some(exit) = handle_console_effect(client, state, app, effect)? {
+            return Ok(Some(exit));
         }
     }
-
-    match parsed
-        .get("kind")
-        .and_then(Value::as_str)
-        .unwrap_or("unknown")
-    {
-        "scope" => {
-            let manifest = parsed
-                .get("scope_manifest")
-                .cloned()
-                .ok_or_else(|| anyhow!("parser returned scope without scope_manifest"))?;
-            let targets = extract_allowlist_targets(&manifest);
-            session.staged_scope_text =
-                Some(serde_yaml::to_string(&manifest).context("failed to stage scope text")?);
-            if let Some(first) = targets.first() {
-                session.last_target = Some(first.clone());
-            }
-            session.push_log(format!(
-                "staged scope manifest with {} allowlisted target(s)",
-                targets.len()
-            ));
-        }
-        "command" => {
-            let command = parsed.get("command").cloned().unwrap_or(Value::Null);
-            if let Some(pipeline) = command.get("pipeline").and_then(Value::as_str) {
-                session.last_pipeline = pipeline.to_string();
-            }
-            if let Some(program) = command.get("program_name").and_then(Value::as_str) {
-                session.last_program = Some(program.to_string());
-            }
-            let targets = command
-                .get("targets")
-                .and_then(Value::as_array)
-                .map(|items| {
-                    items
-                        .iter()
-                        .filter_map(Value::as_str)
-                        .map(ToString::to_string)
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default();
-            if !targets.is_empty() {
-                session.last_target = targets.first().cloned();
-                session.staged_scope_text = Some(build_scope_manifest_text(&targets)?);
-            }
-
-            match command
-                .get("action")
-                .and_then(Value::as_str)
-                .unwrap_or("scan")
-            {
-                "status" => {
-                    for line in
-                        render_status_block(&snapshot.status, snapshot.selected_run.as_ref())
-                    {
-                        session.push_log(line);
-                    }
-                }
-                "oracle" => {
-                    let question = command
-                        .get("question")
-                        .and_then(Value::as_str)
-                        .unwrap_or(text);
-                    session.push_log(format!("staged question: {}", question));
-                    session.push_log("use `oracle <question>` to query Shannon directly");
-                }
-                _ => {
-                    session.push_log("parsed scan context has been staged");
-                    session.push_log("use `run` to launch with the staged target or manifest");
-                }
-            }
-        }
-        _ => {
-            session.push_log("parser did not recognize the input");
-        }
-    }
-
-    Ok(())
+    Ok(None)
 }
 
-fn append_findings_preview(
-    session: &mut ConsoleSessionState,
-    run_id: &str,
-    findings: &[FindingSummary],
-) {
-    session.push_log(format!("{} findings for {}", findings.len(), run_id));
-    for item in findings.iter().take(5) {
-        session.push_log(format!(
-            "[{}] {} ({:.2})",
-            item.severity.to_uppercase(),
-            item.title,
-            item.confidence
-        ));
-    }
-}
-
-fn append_oracle_preview(session: &mut ConsoleSessionState, payload: &Value) {
-    if let Some(answer) = payload.get("answer").and_then(Value::as_str) {
-        session.push_log(format!("oracle: {}", answer));
+fn build_scan_invocation_from_app(app: &App) -> Result<ScanInvocation> {
+    let scope_text = if let Some(scope_text) = app.staged_scope_text.clone() {
+        scope_text
     } else {
-        session
-            .push_log(serde_json::to_string_pretty(payload).unwrap_or_else(|_| "{}".to_string()));
+        let target = app
+            .target
+            .as_deref()
+            .ok_or_else(|| anyhow!("run requires a staged target or scope manifest"))?;
+        build_scope_text(target)?
+    };
+
+    Ok(ScanInvocation {
+        title: app
+            .target
+            .clone()
+            .unwrap_or_else(|| "scope manifest".to_string()),
+        primary_target: app.target.clone(),
+        scope_text,
+        pipeline: app.pipeline.clone(),
+        program: app.program.clone(),
+        remember: true,
+        scope_file: None,
+    })
+}
+
+fn append_oracle_preview(app: &mut App, payload: &Value) {
+    if let Some(answer) = payload.get("answer").and_then(Value::as_str) {
+        app.push_output(format!("oracle: {}", answer));
+    } else {
+        app.push_output(serde_json::to_string_pretty(payload).unwrap_or_else(|_| "{}".to_string()));
     }
     if let Some(items) = payload.get("suggestions").and_then(Value::as_array) {
         let suggestions: Vec<String> = items
@@ -762,7 +596,7 @@ fn append_oracle_preview(session: &mut ConsoleSessionState, payload: &Value) {
             })
             .collect();
         if !suggestions.is_empty() {
-            session.push_log(format!("suggestions: {}", suggestions.join(", ")));
+            app.push_output(format!("suggestions: {}", suggestions.join(", ")));
         }
     }
 }
@@ -821,20 +655,6 @@ fn resolve_run_from_snapshot<'a>(
 ) -> Option<&'a crate::models::RunSummary> {
     runs.iter()
         .find(|run| run.run_id == run_arg || run.run_id.starts_with(run_arg))
-}
-
-fn extract_allowlist_targets(manifest: &Value) -> Vec<String> {
-    manifest
-        .get("allowlist")
-        .and_then(Value::as_array)
-        .map(|items| {
-            items
-                .iter()
-                .filter_map(Value::as_str)
-                .map(ToString::to_string)
-                .collect()
-        })
-        .unwrap_or_default()
 }
 
 fn offline_status(error: &str) -> StatusResponse {

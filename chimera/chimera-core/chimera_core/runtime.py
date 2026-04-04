@@ -181,13 +181,19 @@ class Runtime:
         env: Optional[Dict[str, str]] = None,
     ) -> subprocess.CompletedProcess:
         """Wraps the subprocess call to allow for easy mocking in tests."""
+        merged_env = None
+        if env is not None:
+            # Preserve the parent environment and treat the provided mapping as overrides.
+            merged_env = os.environ.copy()
+            merged_env.update({str(key): str(value) for key, value in env.items()})
+
         process = subprocess.Popen(
             command,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
             cwd=cwd,
-            env=env,
+            env=merged_env,
         )
         self.active_process = process
         try:

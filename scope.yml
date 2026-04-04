@@ -1,160 +1,89 @@
-# Crypto.com Bug Bounty Program Scope
-# Program: https://hackerone.com/crypto
+# ScholarCal - full-scope security assessment
+# Owner: authorized tester (site owner)
+# Date: 2026-04-02
 #
-# ⚠️ IMPORTANT: Always verify current scope on HackerOne before testing
-# ⚠️ Follow all HackerOne program rules and disclosure policies
-# ⚠️ Do not test without explicit authorization
+# NOTE: allowlist entries are ALSO the planner's target list.
+# - URLs with /api → api_rest chain (autoswagger, bola_validator, rate_limit_validator, shannon)
+# - URLs with https:// → web_app chain (strix, browser, shannon)
+# - Bare domain (no scheme) → subdomain chain (subfinder, zypheron, shannon)
+# Hostname matching covers all paths — no need for wildcard entries here.
 
 allowlist:
-  # Main domains
-  - "https://crypto.com"
-  - "https://crypto.com/*"
-  - "https://www.crypto.com"
-  - "https://www.crypto.com/*"
-
-  # Subdomains (based on provided targets)
-  - "https://web.crypto.com"
-  - "https://web.crypto.com/*"
-  - "https://merchant.crypto.com"
-  - "https://merchant.crypto.com/*"
-  - "https://js.crypto.com"
-  - "https://js.crypto.com/*"
-
-  # NFT platform
-  - "https://crypto.com/nft"
-  - "https://crypto.com/nft/*"
-
-  # Exchange (if specified as in-scope on HackerOne)
-  - "https://crypto.com/exchange"
-  - "https://crypto.com/exchange/*"
-
-  # Nadex (verify on HackerOne if still in scope)
-  - "https://nadex.com"
-  - "https://nadex.com/*"
-  - "https://www.nadex.com"
-  - "https://www.nadex.com/*"
-
-  # Wildcard for crypto.com subdomains
-  # ⚠️ Use cautiously - verify each subdomain is in scope
-  - "https://*.crypto.com"
+  # web_app target: strix → browser → shannon
+  - "https://scholarcal.com"
+  # api_rest target: autoswagger → bola_validator → rate_limit_validator → shannon
+  - "https://scholarcal.com/api"
+  # subdomain target: subfinder → zypheron → shannon
+  - "scholarcal.com"
 
 denylist:
-  # Third-party services (typically out of scope)
-  - "*.amazonaws.com"
-  - "*.cloudfront.net"
-  - "*.cloudflare.com"
-  - "*.akamai.net"
-  - "*.fastly.net"
+  # Third-party OAuth/backend — do not test directly
+  - "accounts.google.com"
+  - "login.microsoftonline.com"
+  - "canvas.instructure.com"
+  - "supabase.co"
+  - "supabase.io"
 
-  # Analytics and marketing (typically out of scope)
-  - "*.google-analytics.com"
-  - "*.googletagmanager.com"
-  - "*.doubleclick.net"
-  - "*.facebook.com"
-  - "*.twitter.com"
-  - "*.linkedin.com"
-
-  # CDN and static assets (typically out of scope)
-  - "*.cdn.crypto.com"
-  - "*.static.crypto.com"
-
-  # Common out-of-scope patterns
-  - "status.crypto.com"
-  - "blog.crypto.com"
-  - "*.blog.crypto.com"
-
-  # Etherscan (external blockchain explorer - not owned by Crypto.com)
-  - "*.etherscan.io"
-
-# Authentication notes
-# ⚠️ Update with your actual HackerOne username/identifier
-auth_notes: |
-  HackerOne Program: crypto
-  Tester: rxla
-
-  Authorization:
-  - Follow HackerOne disclosure policy
-  - Report findings only through HackerOne platform
-  - Do not access user data without permission
-  - Do not perform DoS attacks
-  - Do not perform destructive tests on production
-
-  Headers to include:
-  - X-HackerOne: rxla
-  - X-Bug-Bounty: crypto
-
-# Rate limits (conservative for production testing)
 rate_limits:
-  # Requests per second (keep low to avoid DoS)
   requests_per_second: 2
+  concurrency: 3
+  max_requests_per_scan: 5000
 
-  # Maximum concurrent requests
-  concurrency: 2
-
-  # Total request budget per scan (optional)
-  max_requests_per_scan: 10000
-
-# Allowed HTTP methods (safe methods only by default)
 allowed_methods:
   - "GET"
   - "HEAD"
   - "OPTIONS"
-  # Uncomment below only if testing forms/APIs:
-  # - "POST"
-  # - "PUT"
-  # - "PATCH"
-  # - "DELETE"
+  - "POST"
+  - "PUT"
+  - "PATCH"
+  - "DELETE"
 
-# Special notes for Crypto.com testing
-notes: |
-  BEFORE SCANNING:
-  1. ✅ Verify current scope on https://hackerone.com/crypto/policy_scopes
-  2. ✅ Read the full program policy and rules
-  3. ✅ Check for any recent scope changes or announcements
-  4. ✅ Ensure you have a HackerOne account in good standing
-  5. ✅ Update auth_notes with your HackerOne username
-
-  DURING SCANNING:
-  - Start with passive reconnaissance (fixture mode)
-  - Use low rate limits to avoid detection as malicious
-  - Do not test destructive vulnerabilities without explicit permission
-  - Do not attempt to access other users' data
-  - Stop immediately if you discover something critical and report it
-
-  FORBIDDEN ACTIVITIES (typically):
-  - Social engineering attacks
-  - Physical security testing
-  - Denial of Service (DoS/DDoS)
-  - Spamming
-  - Accessing other users' accounts without permission
-  - Testing on production databases
-
-  AFTER FINDINGS:
-  - Report through HackerOne platform only
-  - Do not disclose publicly until program approves
-  - Provide detailed reproduction steps
-  - Include proof-of-concept (non-destructive)
-
-  MOBILE APPS:
-  - com.defi.wallet - Check HackerOne for mobile app testing rules
-  - May require separate authorization
-
-# Tool-specific settings
 tool_settings:
-  # Zypheron (asset discovery)
-  zypheron:
-    aggressive_mode: false  # Keep passive for bug bounty
-    subdomain_bruteforce: false  # Only use wordlists, no brute force
-    port_scan_range: "common"  # Only common ports, not full range
-
-  # VibePentester (penetration testing)
-  vibepentester:
-    aggressive_mode: false
-    enable_sqlmap: false  # Enable only if program allows
-    enable_fuzzing: false  # Enable only if program allows
-
-  # Strix (web scanner)
   strix:
-    crawl_depth: 3  # Limit depth to avoid excessive requests
+    crawl_depth: 4
     follow_redirects: true
     check_robots_txt: true
+
+  zypheron:
+    aggressive_mode: false
+    subdomain_bruteforce: false
+    port_scan_range: "common"
+
+  vibepentester:
+    aggressive_mode: false
+    enable_sqlmap: false
+    enable_fuzzing: true
+
+  autoswagger:
+    base_path: "/api"
+    auth_header: "Authorization"
+    auth_scheme: "Bearer"
+
+# Planner context — passed to generate_plan so bola_validator and jwt_validator
+# are included in the api_rest chain.
+#
+# Credentials are Supabase SSR cookie sessions (expire ~1h).
+# To refresh: POST https://eyeiwbznnhsdefhqjqow.supabase.co/auth/v1/token?grant_type=password
+#   body: {"email":"...","password":"TestPass123!"}
+# Then URL-encode the full response JSON and set as the cookie value below.
+#
+# user_a: chimera_idor_a2@mailinator.com  (event owner, UUID 420576bd-...)
+# user_b: chimera_idor_b@mailinator.com   (peer, UUID 1994ca59-...)
+# object_id: event created by user_a during IDOR verification (2026-04-02)
+context:
+  validation_inputs:
+    target_endpoint: "https://scholarcal.com/api/events"
+    object_id: "472ffc8c-f78a-411b-8a17-463a1981f57b"
+    user_a_creds:
+      headers:
+        Cookie: "sb-eyeiwbznnhsdefhqjqow-auth-token=REPLACE_WITH_USER_A_SESSION"
+    user_b_creds:
+      headers:
+        Cookie: "sb-eyeiwbznnhsdefhqjqow-auth-token=REPLACE_WITH_USER_B_SESSION"
+
+# Attack surface notes (for Shannon context):
+# 1. BOLA/IDOR: PATCH/DELETE /api/events?id=<uuid> — can user A touch user B's events?
+# 2. Unauthenticated iCal: GET /api/calendar/ical?token=X — feed token entropy/reuse
+# 3. Rate limit on POST /api/mail/send — email abuse
+# 4. Mass assignment: PATCH /api/events with undocumented fields
+# 5. Supabase RLS bypass — all isolation relies on row-level policies

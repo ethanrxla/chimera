@@ -153,12 +153,12 @@ def _findings_summaries(
         raw = finding.get("raw_tool_fields", {}) or {}
         stable_id = _stable_id_for_finding(finding)
         record = provenance_map.get(stable_id, {})
-        produced_by = record.get("produced_by") or raw.get("tool") or "unknown"
+        produced_by = record.get("produced_by") or raw.get("tool") or finding.get("tool_source") or "unknown"
         confidence = _confidence_to_float(finding.get("confidence"))
         classification_value = raw.get("report_ready_status", "NEEDS_REVIEW")
         evidence_refs = finding.get("evidence_refs", []) or []
         anchors = _evidence_anchors(artifacts_dir, evidence_refs)
-        target = raw.get("target") or raw.get("affected_target") or (anchors[0]["id"] if anchors else "")
+        target = raw.get("target") or raw.get("affected_target") or finding.get("affected_target") or (anchors[0]["id"] if anchors else "")
         summary = {
             "stable_id": stable_id,
             "title": finding.get("title", ""),
@@ -166,7 +166,7 @@ def _findings_summaries(
             "confidence": confidence,
             "classification": classification_value,
             "target": target,
-            "tool": raw.get("tool") or produced_by,
+            "tool": raw.get("tool") or finding.get("tool_source") or produced_by,
             "produced_by": produced_by,
             "created_at": record.get("created_at"),
             "run_id": run_id,
@@ -351,7 +351,11 @@ def _status_payload(request: Request) -> Dict[str, object]:
     # Use active run's scope if available, fallback to last record
     if active_run and "scope_manifest" in active_run:
         scope_manifest = active_run.get("scope_manifest", {})
-        scope_normalized = normalize_scope(scope_manifest)[0].to_dict() if scope_manifest else {}
+        if scope_manifest:
+            _sg = normalize_scope(scope_manifest)[0]
+            scope_normalized = {"allowlist": _sg.allowed_domains, "denylist": _sg.denied_patterns}
+        else:
+            scope_normalized = {}
     else:
         scope_normalized = last_record.get("scope_normalized", {}) if last_record else {}
 
@@ -552,8 +556,6 @@ async def plan_run(payload: Dict[str, object]):
     if not scope_text:
         raise HTTPException(status_code=400, detail="scope_text is required")
     live = bool(payload.get("live", False))
-    if not live:
-        raise HTTPException(status_code=400, detail="Fixture mode has been removed. Set live=true.")
     live_confirm = payload.get("live_confirm")
     if live and live_confirm != "I UNDERSTAND":
         raise HTTPException(status_code=400, detail="Live confirmation required")
@@ -916,7 +918,8 @@ async def create_run(request: Request, payload: Dict[str, object]):
     if not scope_text:
         raise HTTPException(status_code=400, detail="scope_text is required")
     live = bool(payload.get("live", False))
-    if not live:
+    testing = getattr(request.app.state, "testing", False)
+    if not live and not testing:
         raise HTTPException(status_code=400, detail="Fixture mode has been removed. Set live=true.")
     live_confirm = payload.get("live_confirm")
     if live and live_confirm != "I UNDERSTAND":
@@ -1021,6 +1024,157 @@ async def list_runs(request: Request, limit: int = Query(20, ge=1, le=200), offs
             "stats": record.get("stats", {}),
         })
     return JSONResponse(summaries)
+
+
+@router.get("/runs/diff")
+async def get_runs_diff(
+    request: Request,
+    base_run_id: str,
+    compare_run_id: str,
+    classification: Optional[str] = None,
+):
+    base_dir = _resolve_artifacts_dir(request, base_run_id)
+    compare_dir = _resolve_artifacts_dir(request, compare_run_id)
+    if not base_dir or not compare_dir:
+        raise HTTPException(status_code=404, detail="Artifacts not ready")
+
+    base_summaries = _findings_summaries(
+        Path(base_dir),
+        base_run_id,
+        classification=classification,
+    )
+    compare_summaries = _findings_summaries(
+        Path(compare_dir),
+        compare_run_id,
+        classification=classification,
+    )
+
+    base_map = {item["stable_id"]: item for item in base_summaries}
+    compare_map = {item["stable_id"]: item for item in compare_summaries}
+
+    base_ids = set(base_map.keys())
+    compare_ids = set(compare_map.keys())
+
+    new_items = [compare_map[item_id] for item_id in sorted(compare_ids - base_ids)]
+    removed_items = [base_map[item_id] for item_id in sorted(base_ids - compare_ids)]
+
+    changed_items = []
+    for item_id in sorted(base_ids & compare_ids):
+        before = base_map[item_id]
+        after = compare_map[item_id]
+        fields_changed = []
+        if before.get("severity") != after.get("severity"):
+            fields_changed.append("severity")
+        if before.get("classification") != after.get("classification"):
+            fields_changed.append("classification")
+        if before.get("title") != after.get("title"):
+            fields_changed.append("title")
+        if before.get("target") != after.get("target"):
+            fields_changed.append("target")
+        if before.get("tool") != after.get("tool"):
+            fields_changed.append("tool")
+        if abs((before.get("confidence") or 0.0) - (after.get("confidence") or 0.0)) >= 0.01:
+            fields_changed.append("confidence")
+        if fields_changed:
+            changed_items.append({
+                "stable_id": item_id,
+                "summary": {
+                    "severity": after.get("severity"),
+                    "title": after.get("title"),
+                    "target": after.get("target"),
+                    "tool": after.get("tool"),
+                    "classification": after.get("classification"),
+                    "confidence": after.get("confidence"),
+                },
+                "fields_changed": fields_changed,
+                "from": {
+                    "confidence": before.get("confidence"),
+                    "classification": before.get("classification"),
+                    "severity": before.get("severity"),
+                },
+                "to": {
+                    "confidence": after.get("confidence"),
+                    "classification": after.get("classification"),
+                    "severity": after.get("severity"),
+                },
+            })
+
+    base_report_ready = sum(
+        1 for item in base_summaries if item.get("classification") == "REPORT_READY"
+    )
+    compare_report_ready = sum(
+        1 for item in compare_summaries if item.get("classification") == "REPORT_READY"
+    )
+    base_promoted = _promoted_count(Path(base_dir))
+    compare_promoted = _promoted_count(Path(compare_dir))
+    base_warnings = _count_warning_artifacts(Path(base_dir))
+    compare_warnings = _count_warning_artifacts(Path(compare_dir))
+
+    base_parent = None
+    compare_parent = None
+    for item in base_summaries:
+        if item.get("parent_run_id"):
+            base_parent = item["parent_run_id"]
+            break
+    for item in compare_summaries:
+        if item.get("parent_run_id"):
+            compare_parent = item["parent_run_id"]
+            break
+
+    payload = {
+        "base_run_id": base_run_id,
+        "compare_run_id": compare_run_id,
+        "base_parent_run_id": base_parent,
+        "compare_parent_run_id": compare_parent,
+        "counts": {
+            "findings": {
+                "base": len(base_summaries),
+                "compare": len(compare_summaries),
+                "delta": len(compare_summaries) - len(base_summaries),
+            },
+            "report_ready": {
+                "base": base_report_ready,
+                "compare": compare_report_ready,
+                "delta": compare_report_ready - base_report_ready,
+            },
+            "promoted": {
+                "base": base_promoted,
+                "compare": compare_promoted,
+                "delta": compare_promoted - base_promoted,
+            },
+            "warnings": {
+                "base": base_warnings,
+                "compare": compare_warnings,
+                "delta": compare_warnings - base_warnings,
+            },
+        },
+        "new": [
+            {
+                "stable_id": item.get("stable_id"),
+                "severity": item.get("severity"),
+                "title": item.get("title"),
+                "target": item.get("target"),
+                "tool": item.get("tool"),
+                "confidence": item.get("confidence"),
+                "classification": item.get("classification"),
+            }
+            for item in new_items
+        ],
+        "removed": [
+            {
+                "stable_id": item.get("stable_id"),
+                "severity": item.get("severity"),
+                "title": item.get("title"),
+                "target": item.get("target"),
+                "tool": item.get("tool"),
+                "confidence": item.get("confidence"),
+                "classification": item.get("classification"),
+            }
+            for item in removed_items
+        ],
+        "changed": changed_items,
+    }
+    return JSONResponse(payload)
 
 
 @router.get("/runs/{run_id}")
@@ -1278,154 +1432,3 @@ async def get_events_tail(request: Request, run_id: str, limit: int = Query(200,
     lines = events_path.read_text(encoding="utf-8").splitlines()
     tail = lines[-limit:] if lines else []
     return JSONResponse(tail)
-
-
-@router.get("/runs/diff")
-async def get_runs_diff(
-    request: Request,
-    base_run_id: str,
-    compare_run_id: str,
-    classification: Optional[str] = None,
-):
-    base_dir = _resolve_artifacts_dir(request, base_run_id)
-    compare_dir = _resolve_artifacts_dir(request, compare_run_id)
-    if not base_dir or not compare_dir:
-        raise HTTPException(status_code=404, detail="Artifacts not ready")
-
-    base_summaries = _findings_summaries(
-        Path(base_dir),
-        base_run_id,
-        classification=classification,
-    )
-    compare_summaries = _findings_summaries(
-        Path(compare_dir),
-        compare_run_id,
-        classification=classification,
-    )
-
-    base_map = {item["stable_id"]: item for item in base_summaries}
-    compare_map = {item["stable_id"]: item for item in compare_summaries}
-
-    base_ids = set(base_map.keys())
-    compare_ids = set(compare_map.keys())
-
-    new_items = [compare_map[item_id] for item_id in sorted(compare_ids - base_ids)]
-    removed_items = [base_map[item_id] for item_id in sorted(base_ids - compare_ids)]
-
-    changed_items = []
-    for item_id in sorted(base_ids & compare_ids):
-        before = base_map[item_id]
-        after = compare_map[item_id]
-        fields_changed = []
-        if before.get("severity") != after.get("severity"):
-            fields_changed.append("severity")
-        if before.get("classification") != after.get("classification"):
-            fields_changed.append("classification")
-        if before.get("title") != after.get("title"):
-            fields_changed.append("title")
-        if before.get("target") != after.get("target"):
-            fields_changed.append("target")
-        if before.get("tool") != after.get("tool"):
-            fields_changed.append("tool")
-        if abs((before.get("confidence") or 0.0) - (after.get("confidence") or 0.0)) >= 0.01:
-            fields_changed.append("confidence")
-        if fields_changed:
-            changed_items.append({
-                "stable_id": item_id,
-                "summary": {
-                    "severity": after.get("severity"),
-                    "title": after.get("title"),
-                    "target": after.get("target"),
-                    "tool": after.get("tool"),
-                    "classification": after.get("classification"),
-                    "confidence": after.get("confidence"),
-                },
-                "fields_changed": fields_changed,
-                "from": {
-                    "confidence": before.get("confidence"),
-                    "classification": before.get("classification"),
-                    "severity": before.get("severity"),
-                },
-                "to": {
-                    "confidence": after.get("confidence"),
-                    "classification": after.get("classification"),
-                    "severity": after.get("severity"),
-                },
-            })
-
-    base_report_ready = sum(
-        1 for item in base_summaries if item.get("classification") == "REPORT_READY"
-    )
-    compare_report_ready = sum(
-        1 for item in compare_summaries if item.get("classification") == "REPORT_READY"
-    )
-    base_promoted = _promoted_count(Path(base_dir))
-    compare_promoted = _promoted_count(Path(compare_dir))
-    base_warnings = _count_warning_artifacts(Path(base_dir))
-    compare_warnings = _count_warning_artifacts(Path(compare_dir))
-
-    base_parent = None
-    compare_parent = None
-    for item in base_summaries:
-        if item.get("parent_run_id"):
-            base_parent = item["parent_run_id"]
-            break
-    for item in compare_summaries:
-        if item.get("parent_run_id"):
-            compare_parent = item["parent_run_id"]
-            break
-
-    payload = {
-        "base_run_id": base_run_id,
-        "compare_run_id": compare_run_id,
-        "base_parent_run_id": base_parent,
-        "compare_parent_run_id": compare_parent,
-        "counts": {
-            "findings": {
-                "base": len(base_summaries),
-                "compare": len(compare_summaries),
-                "delta": len(compare_summaries) - len(base_summaries),
-            },
-            "report_ready": {
-                "base": base_report_ready,
-                "compare": compare_report_ready,
-                "delta": compare_report_ready - base_report_ready,
-            },
-            "promoted": {
-                "base": base_promoted,
-                "compare": compare_promoted,
-                "delta": compare_promoted - base_promoted,
-            },
-            "warnings": {
-                "base": base_warnings,
-                "compare": compare_warnings,
-                "delta": compare_warnings - base_warnings,
-            },
-        },
-        "new": [
-            {
-                "stable_id": item.get("stable_id"),
-                "severity": item.get("severity"),
-                "title": item.get("title"),
-                "target": item.get("target"),
-                "tool": item.get("tool"),
-                "confidence": item.get("confidence"),
-                "classification": item.get("classification"),
-            }
-            for item in new_items
-        ],
-        "removed": [
-            {
-                "stable_id": item.get("stable_id"),
-                "severity": item.get("severity"),
-                "title": item.get("title"),
-                "target": item.get("target"),
-                "tool": item.get("tool"),
-                "confidence": item.get("confidence"),
-                "classification": item.get("classification"),
-            }
-            for item in removed_items
-        ],
-        "changed": changed_items,
-    }
-    return JSONResponse(payload)

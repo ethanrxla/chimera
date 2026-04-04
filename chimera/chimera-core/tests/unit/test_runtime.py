@@ -71,3 +71,25 @@ def test_runtime_rate_limiter_caps_requests(runtime_setup, public_dns):
         runtime.run_cmd(command)
 
     assert runtime.rate_limiter.acquire.call_count == 3
+
+
+def test_execute_subprocess_merges_parent_environment(runtime_setup, monkeypatch):
+    runtime, _ = runtime_setup
+    captured = {}
+
+    class DummyProcess:
+        def __init__(self, *args, **kwargs):
+            captured["env"] = kwargs.get("env")
+            self.returncode = 0
+
+        def communicate(self, timeout=None):
+            return ("", "")
+
+    monkeypatch.setenv("PARENT_ONLY_VAR", "present")
+    monkeypatch.setattr("subprocess.Popen", DummyProcess)
+
+    result = runtime._execute_subprocess(["python", "-c", "print('ok')"], env={"CHILD_ONLY_VAR": "set"})
+
+    assert result.returncode == 0
+    assert captured["env"]["PARENT_ONLY_VAR"] == "present"
+    assert captured["env"]["CHILD_ONLY_VAR"] == "set"

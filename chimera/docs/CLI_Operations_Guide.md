@@ -41,21 +41,49 @@ cargo run -- exploit --run <run_id> <chain_id> --replay
 cargo run -- oracle --run <run_id> "What could go wrong with this GraphQL endpoint?"
 ```
 
-Running `cargo run --` in a TTY now opens the idle Chimera console. It uses a ratatui control
-surface with recent runs, selected-run telemetry, findings, and a command prompt. The prompt accepts
-both direct commands and freeform input staged through `/v1/parser/interpret`.
+Running `cargo run --` in a TTY now opens the Chimera operator console. The Ratatui shell is split
+into a menu, context panel, recent-runs panel, output/log pane, footer hints, and a bottom input
+bar. Startup now opens with a matrix-rain splash screen; press `1` or `Enter` to continue, `?` for
+startup help, or set `CHIMERA_MATRIX=0` to skip the splash. The console itself supports three input
+modes:
+
+- `NORMAL`: menu-driven navigation and pane switching
+- `COMMAND`: exact commands for predictable operator flows
+- `NLP`: model-backed requests routed through `/v1/parser/interpret`
+
+Default keys:
+
+```text
+j/k or arrows  move
+Enter          open or execute
+Tab            switch pane
+:              command mode
+/              NLP mode
+?              help modal
+q              back or quit
+```
 
 Useful console commands:
 
 ```text
 set target https://crapi.example.com
+set workflow standard
 set pipeline recon
 set program HackerOne Demo
-run
+scan quick
 show runs
-use <run_id>
 show findings
+show logs
+theme red
 oracle What could go wrong with this GraphQL endpoint?
+```
+
+Example NLP prompts:
+
+```text
+set the target to 10.0.0.8 and show the next recommended step
+run the standard workflow on the current target
+why did this command fail
 ```
 
 ## Browser Operations

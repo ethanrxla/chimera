@@ -656,6 +656,10 @@ class PlanRunner:
 
     def _execute_task(self, task: DagTask) -> tuple[List[Finding], List[Dict[str, object]]]:
         if task.tool in {"autoswagger", "strix", "shannon", "net-utils", "subfinder", "browser"}:
+            if task.tool == "shannon":
+                prior = self._findings_by_target.get(task.target, [])
+                if prior:
+                    task.options = {**task.options, "prior_findings": [f.to_dict() for f in prior]}
             adapter = self._adapter_for_task(task)
             output = adapter.run([task.target])
             if task.tool == "autoswagger":

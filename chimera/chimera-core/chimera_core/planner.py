@@ -114,6 +114,7 @@ def _build_tasks_for_target(
     target: str,
     capabilities: List[str],
     shannon_options: Dict[str, object],
+    target_context: Dict[str, object],
 ) -> None:
     previous_task_id = None
     for step_index, capability in enumerate(capabilities):
@@ -124,6 +125,10 @@ def _build_tasks_for_target(
             options = {"scan_mode": "standard"}
         elif capability == "shannon":
             options = dict(shannon_options)
+        elif capability in {"bola_validator", "jwt_validator"}:
+            validation_inputs = target_context.get("validation_inputs")
+            if validation_inputs:
+                options = {"validation_inputs": dict(validation_inputs)}
         task_id = f"{capability}-{index}-{step_index}"
         task = Task(
             task_id=task_id,
@@ -183,6 +188,7 @@ def generate_plan(scope_graph, scope_policy, context) -> ExecutionPlan:
             target=domain,
             capabilities=executable,
             shannon_options=shannon_options,
+            target_context=target_context,
         )
 
     return plan

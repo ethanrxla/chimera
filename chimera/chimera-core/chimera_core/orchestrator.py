@@ -118,7 +118,7 @@ class Orchestrator:
             # 2. Tool Selection & Planning
             job.status = JobStatus.PLANNING_TESTS
             print(f"[Orchestrator] Job {job_id} status: {job.status.value}")
-            plan = generate_plan(scope_graph, scope_policy, None)
+            plan = generate_plan(scope_graph, scope_policy, job.scope_manifest.get("context", {}))
             self._emit_event(
                 event_sink,
                 "plan_created",

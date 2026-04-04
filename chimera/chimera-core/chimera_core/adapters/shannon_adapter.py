@@ -252,6 +252,27 @@ class ShannonAdapter(AdapterBase):
         vuln_types = opts.get("vuln_types") or ["injection", "xss", "ssrf", "broken_auth"]
         if isinstance(vuln_types, str):
             vuln_types = [vuln_types]
+
+        prior_findings = opts.get("prior_findings") or []
+        if prior_findings:
+            findings_json = json.dumps(prior_findings, indent=2)
+            template = str(
+                opts.get("query_template")
+                or (
+                    "Target(s): {targets}\n\n"
+                    "Prior tool findings (verify, enrich, and look for exploit chains):\n"
+                    "{findings_summary}\n\n"
+                    "Additionally check for: {vuln_types}"
+                )
+            )
+            return template.format(
+                target=targets[0],
+                targets=", ".join(targets),
+                vuln_types=", ".join(str(v) for v in vuln_types),
+                mode=str(opts.get("mode") or "verify"),
+                findings_summary=findings_json,
+            )
+
         template = str(
             opts.get("query_template")
             or "Verify {targets} for {vuln_types} and report findings with proof-of-exploit steps."
@@ -259,7 +280,7 @@ class ShannonAdapter(AdapterBase):
         return template.format(
             target=targets[0],
             targets=", ".join(targets),
-            vuln_types=", ".join(vuln_types),
+            vuln_types=", ".join(str(v) for v in vuln_types),
             mode=str(opts.get("mode") or "verify"),
         )
 

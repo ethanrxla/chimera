@@ -50,6 +50,46 @@ The main services are:
 - `chimera-ui`: containerized UI launcher
 - `chimera-cli`: persistent Rust CLI container for `docker compose exec`
 
+## Local Security Model Service
+
+Chimera's `shannon` verification service can target either Anthropic or an OpenAI-compatible backend. The repo now defaults to the local OpenAI-compatible path, and the bundled vLLM service defaults to `WhiteRabbitNeo/WhiteRabbitNeo-2.5-Qwen-2.5-Coder-7B`.
+
+Use an external OpenAI-compatible endpoint:
+
+```bash
+export SHANNON_PROVIDER=openai_compatible
+export SHANNON_MODEL=WhiteRabbitNeo-2.5-Qwen-2.5-Coder-7B
+export SHANNON_OPENAI_BASE_URL=http://<your-llm-host>:8000/v1
+export SHANNON_OPENAI_API_KEY=dummy
+docker compose up -d shannon chimera-core chimera-ui chimera-cli
+```
+
+Or run the bundled local vLLM profile on a GPU host with the default WhiteRabbit preset:
+
+```bash
+export HUGGING_FACE_HUB_TOKEN=hf_...
+docker compose --profile local-llm up -d sec-llm shannon chimera-core chimera-ui chimera-cli
+```
+
+Switch presets without changing Chimera:
+
+```bash
+# Default preset
+export LOCAL_LLM_PRESET=whiterabbit-qwen
+
+# Alternative presets
+export LOCAL_LLM_PRESET=whiterabbit-llama-8b
+export LOCAL_LLM_PRESET=deephat
+```
+
+Notes:
+
+- The optional `sec-llm` service uses `vllm/vllm-openai` and exposes port `8001` on the host.
+- It keeps `deephat` as a Docker network alias for backward compatibility.
+- The model weights are cached under `${HOME}/.cache/huggingface`.
+- No manual model repo clone is required for the default path. `vLLM` downloads the model weights from Hugging Face into the mounted cache on first start.
+- WhiteRabbitNeo and DeepHat both carry additional usage restrictions beyond their base model licenses. Review the model cards before enabling them in production workflows.
+
 ## Optional Lab Targets
 
 Bring up the local lab profile:

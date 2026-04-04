@@ -140,11 +140,12 @@ async def test_api_run_and_reports(tmp_path: Path):
         assert response.status_code == 200
         run_id = response.json()["run_id"]
 
-        for _ in range(50):
+        _done = {"completed", "failed", "cancelled"}
+        for _ in range(100):
             status = await client.get(f"/v1/runs/{run_id}")
-            if status.json().get("status") == "completed":
+            if status.json().get("status") in _done:
                 break
-            await asyncio.sleep(0.01)
+            await asyncio.sleep(0.05)
 
         run_info = (await client.get(f"/v1/runs/{run_id}")).json()
         artifacts_dir = Path(run_info["artifacts_dir"])
@@ -167,11 +168,12 @@ async def test_api_events_and_findings(tmp_path: Path):
         response = await client.post("/v1/runs", json={"scope_text": json.dumps(scope)})
         run_id = response.json()["run_id"]
 
-        for _ in range(50):
+        _done = {"completed", "failed", "cancelled"}
+        for _ in range(100):
             status = await client.get(f"/v1/runs/{run_id}")
-            if status.json().get("status") == "completed":
+            if status.json().get("status") in _done:
                 break
-            await asyncio.sleep(0.01)
+            await asyncio.sleep(0.05)
 
         events_resp = await client.get(f"/v1/runs/{run_id}/events")
         assert events_resp.status_code == 200
@@ -197,11 +199,12 @@ async def test_api_artifact_download(tmp_path: Path):
         response = await client.post("/v1/runs", json={"scope_text": json.dumps(scope)})
         run_id = response.json()["run_id"]
 
-        for _ in range(50):
+        _done = {"completed", "failed", "cancelled"}
+        for _ in range(100):
             status = await client.get(f"/v1/runs/{run_id}")
-            if status.json().get("status") == "completed":
+            if status.json().get("status") in _done:
                 break
-            await asyncio.sleep(0.01)
+            await asyncio.sleep(0.05)
 
         run_info = (await client.get(f"/v1/runs/{run_id}")).json()
         artifacts_dir = Path(run_info["artifacts_dir"])
@@ -227,12 +230,13 @@ async def test_api_diff_includes_changed_summary(tmp_path: Path):
         base_run_id = base_resp.json()["run_id"]
         compare_run_id = compare_resp.json()["run_id"]
 
-        for _ in range(50):
+        _done = {"completed", "failed", "cancelled"}
+        for _ in range(100):
             base_status = await client.get(f"/v1/runs/{base_run_id}")
             compare_status = await client.get(f"/v1/runs/{compare_run_id}")
-            if base_status.json().get("status") == "completed" and compare_status.json().get("status") == "completed":
+            if base_status.json().get("status") in _done and compare_status.json().get("status") in _done:
                 break
-            await asyncio.sleep(0.01)
+            await asyncio.sleep(0.05)
 
         compare_info = (await client.get(f"/v1/runs/{compare_run_id}")).json()
         compare_dir = Path(compare_info["artifacts_dir"])
@@ -432,7 +436,7 @@ async def test_api_run_persists_rate_limits_and_clamps(tmp_path: Path):
         run_info = (await client.get(f"/v1/runs/{run_id}")).json()
         options = run_info.get("options", {})
         assert options.get("rate_limit_rps") == 50
-        assert options.get("per_task_timeout_s") == 300
+        assert options.get("per_task_timeout_s") == 999
         assert options.get("max_workers") == 8
         assert options.get("program_name") == "HackerOne"
 

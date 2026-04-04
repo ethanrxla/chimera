@@ -21,7 +21,7 @@ services:
       - STRIX_IMAGE=${STRIX_IMAGE:-ghcr.io/usestrix/strix-sandbox:0.1.10}
       - CHIMERA_SHANNON_ENABLED=${CHIMERA_SHANNON_ENABLED:-true}
       - CHIMERA_SHANNON_VERIFY_AVAILABILITY=${CHIMERA_SHANNON_VERIFY_AVAILABILITY:-true}
-      - SHANNON_BASE_URL=${SHANNON_BASE_URL:-http://localhost:8080}
+      - SHANNON_BASE_URL=${SHANNON_BASE_URL:-http://shannon:8080}
       - PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
     env_file:
       - .env
@@ -63,6 +63,116 @@ services:
     depends_on:
       - chimera-core
     command: ["bash", "-lc", "cd chimera-ui && xvfb-run -a python3 launcher.py"]
+    restart: unless-stopped
+
+  shannon:
+    build:
+      context: ./tools/shannon-svc
+    container_name: shannon
+    environment:
+      - SHANNON_PROVIDER=${SHANNON_PROVIDER:-anthropic}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - SHANNON_MODEL=${SHANNON_MODEL:-Mistral-7B-Instruct-v0.3-AWQ}
+      - SHANNON_OPENAI_BASE_URL=${SHANNON_OPENAI_BASE_URL:-http://sec-llm:8000/v1}
+      - SHANNON_OPENAI_API_KEY=${SHANNON_OPENAI_API_KEY:-dummy}
+      - SHANNON_MAX_TOKENS=${SHANNON_MAX_TOKENS:-8096}
+      - SHANNON_TEMPERATURE=${SHANNON_TEMPERATURE:-0.1}
+    ports:
+      - "8080:8080"
+    restart: unless-stopped
+
+  sec-llm:
+    image: vllm/vllm-openai:latest
+    container_name: sec-llm
+    profiles: ["local-llm"]
+    environment:
+      - HUGGING_FACE_HUB_TOKEN=${HUGGING_FACE_HUB_TOKEN}
+      - LOCAL_LLM_PRESET=${LOCAL_LLM_PRESET:-whiterabbit-qwen}
+      - LOCAL_LLM_MODEL_ID=${LOCAL_LLM_MODEL_ID:-}
+      - LOCAL_LLM_SERVED_MODEL_NAME=${LOCAL_LLM_SERVED_MODEL_NAME:-}
+      # 4096 is a safe context for 6 GB VRAM; override with LOCAL_LLM_MAX_MODEL_LEN
+      - LOCAL_LLM_MAX_MODEL_LEN=${LOCAL_LLM_MAX_MODEL_LEN:-4096}
+      # GPU memory: 0.82 * 6 GB = 4.92 GB < 5.0 GB free after WDDM overhead
+      - LOCAL_LLM_GPU_MEMORY_UTILIZATION=${LOCAL_LLM_GPU_MEMORY_UTILIZATION:-0.82}
+    volumes:
+      - ${HOME}/.cache/huggingface:/root/.cache/huggingface
+    ports:
+      - "8001:8000"
+    ipc: host
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    entrypoint:
+      - /bin/sh
+      - -lc
+    command: >
+      PRESET="$${LOCAL_LLM_PRESET:-whiterabbit-qwen}";
+      MODEL_ID="$${LOCAL_LLM_MODEL_ID:-}";
+      SERVED_NAME="$${LOCAL_LLM_SERVED_MODEL_NAME:-}";
+      QUANT="";
+      if [ -z "$$MODEL_ID" ]; then
+        case "$$PRESET" in
+          whiterabbit-qwen)
+            MODEL_ID="TheBloke/Mistral-7B-Instruct-v0.3-AWQ";
+            DEFAULT_NAME="Mistral-7B-Instruct-v0.3-AWQ";
+            QUANT="awq"
+            ;;
+          whiterabbit-13b)
+            MODEL_ID="TheBloke/WhiteRabbitNeo-2-13B-AWQ";
+            DEFAULT_NAME="WhiteRabbitNeo-2-13B-AWQ";
+            QUANT="awq"
+            ;;
+          whiterabbit-llama-8b)
+            MODEL_ID="WhiteRabbitNeo/Llama-3.1-WhiteRabbitNeo-2-8B";
+            DEFAULT_NAME="Llama-3.1-WhiteRabbitNeo-2-8B"
+            ;;
+          deephat)
+            MODEL_ID="DeepHat/DeepHat-V1-7B";
+            DEFAULT_NAME="DeepHat-V1-7B"
+            ;;
+          *)
+            echo "Unsupported LOCAL_LLM_PRESET: $$PRESET" >&2;
+            exit 1
+            ;;
+        esac;
+      else
+        DEFAULT_NAME="$${MODEL_ID##*/}";
+        case "$$MODEL_ID" in *AWQ*|*awq*) QUANT="awq" ;; esac;
+      fi;
+      if [ -z "$$SERVED_NAME" ]; then
+        SERVED_NAME="$$DEFAULT_NAME";
+      fi;
+      QUANT_FLAG="";
+      if [ -n "$$QUANT" ]; then QUANT_FLAG="--quantization $$QUANT"; fi;
+      exec python3 -m vllm.entrypoints.openai.api_server \
+        --model "$$MODEL_ID" \
+        --served-model-name "$$SERVED_NAME" \
+        --host 0.0.0.0 --port 8000 \
+        --max-model-len "$${LOCAL_LLM_MAX_MODEL_LEN:-4096}" \
+        --gpu-memory-utilization "$${LOCAL_LLM_GPU_MEMORY_UTILIZATION:-0.82}" \
+        --enforce-eager \
+        $${QUANT_FLAG}
+    networks:
+      default:
+        aliases:
+          - deephat
+    restart: unless-stopped
+
+  hexstrike:
+    build:
+      context: ./tools/hexstrike-mcp
+    container_name: hexstrike
+    environment:
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - FIRECRAWL_API_KEY=${FIRECRAWL_API_KEY:-}
+      - SERPAPI_API_KEY=${SERPAPI_API_KEY:-}
+    ports:
+      - "8888:8888"
     restart: unless-stopped
 
   juice-shop:
