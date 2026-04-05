@@ -1,0 +1,23 @@
+[submodule "tools/autoswagger"]
+	path = tools/autoswagger
+	url = https://github.com/intruder-io/autoswagger.git
+
+[submodule "tools/decepticon"]
+	path = tools/decepticon
+	url = https://github.com/PurpleAILAB/Decepticon.git
+
+[submodule "tools/strix"]
+	path = tools/strix
+	url = https://github.com/usestrix/strix.git
+
+[submodule "tools/vibe-pentester"]
+	path = tools/vibe-pentester
+	url = https://github.com/nellcorp/vibe-pen-tester.git
+
+[submodule "tools/zypheron"]
+	path = tools/zypheron
+	url = https://github.com/peterpodj/zypheron-cli.git
+
+[submodule "tools/shannon"]
+	path = tools/shannon
+	url = https://github.com/KeygraphHQ/shannon.git
