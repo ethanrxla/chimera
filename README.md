@@ -109,46 +109,58 @@ export SHANNON_OPENAI_API_KEY=dummy
 docker compose up -d shannon chimera-core chimera-ui chimera-cli
 ```
 
-Or run the bundled local vLLM profile on a GPU host. Shannon must be pointed at sec-llm explicitly — the default provider is Anthropic:
+Or run a local GPU model via Ollama + GGUF — the recommended path for RTX 50-series (Blackwell):
 
 ```bash
-# Default preset (Mistral-7B AWQ, ~4 GB VRAM)
-export HUGGING_FACE_HUB_TOKEN=hf_...
-export LOCAL_LLM_PRESET=whiterabbit-qwen
-export SHANNON_PROVIDER=openai_compatible
-export SHANNON_MODEL=Mistral-7B-Instruct-v0.3-AWQ
-COMPOSE_PROFILES=local-llm docker compose up -d sec-llm shannon chimera-core chimera-ui chimera-cli
+# 1. Start Ollama with GPU
+COMPOSE_PROFILES=ollama docker compose up -d ollama
+
+# 2. Pull the model (one-time, ~8 GB download)
+docker exec ollama-gpu ollama pull hf.co/bartowski/WhiteRabbitNeo-13B-v1-GGUF:Q4_K_M
+
+# 3. Confirm the model name Ollama assigned
+docker exec ollama-gpu ollama list
+
+# 4. Start the rest of the stack
+COMPOSE_PROFILES=ollama,lab docker compose up -d shannon chimera-core chimera-cli juice-shop
+```
+
+Shannon's default `SHANNON_OPENAI_BASE_URL` already points to `http://ollama:11434/v1`. The only `.env` values needed:
+
+```bash
+SHANNON_PROVIDER=openai_compatible
+SHANNON_MODEL=hf.co/bartowski/WhiteRabbitNeo-13B-v1-GGUF:Q4_K_M
+```
+
+**7B fallback** if 13B exceeds VRAM (~4 GB instead of ~8 GB):
+
+```bash
+docker exec ollama-gpu ollama pull hf.co/bartowski/WhiteRabbitNeo-V3-7B-GGUF:IQ4_XS
+# then set: SHANNON_MODEL=hf.co/bartowski/WhiteRabbitNeo-V3-7B-GGUF:IQ4_XS
 ```
 
 > **Compose v5 note:** `--profile` flags combined with explicit service names trigger a validation bug in Docker Compose v5 (`no such service`). Use `COMPOSE_PROFILES=` as an environment variable instead — it is evaluated before service name resolution.
 
-Switch presets without changing Chimera (set `SHANNON_MODEL` to match the served model name):
-
-```bash
-# WhiteRabbitNeo 13B AWQ — best fit for RTX 5070 12 GB (~8 GB VRAM, context 4096)
-export LOCAL_LLM_PRESET=whiterabbit-13b
-export LOCAL_LLM_MAX_MODEL_LEN=4096
-export LOCAL_LLM_GPU_MEMORY_UTILIZATION=0.82
-export SHANNON_MODEL=WhiteRabbitNeo-13B-AWQ
-
-# Llama 3.1 8B WhiteRabbitNeo (no AWQ, higher VRAM per token)
-export LOCAL_LLM_PRESET=whiterabbit-llama-8b
-export SHANNON_MODEL=Llama-3.1-WhiteRabbitNeo-2-8B
-
-# DeepHat 7B
-export LOCAL_LLM_PRESET=deephat
-export SHANNON_MODEL=DeepHat-V1-7B
-```
-
-> **RTX 5070 / Blackwell note:** The vLLM service runs with `--enforce-eager` which disables CUDA graphs. This is required for Blackwell (sm_120) until vLLM ships pre-compiled Blackwell kernels. Inference is slightly slower but functionally correct.
-
 Notes:
 
-- The optional `sec-llm` service uses `vllm/vllm-openai` and exposes port `8001` on the host.
-- It keeps `deephat` as a Docker network alias for backward compatibility.
-- The model weights are cached under `${HOME}/.cache/huggingface`.
-- No manual model repo clone is required for the default path. `vLLM` downloads the model weights from Hugging Face into the mounted cache on first start.
-- WhiteRabbitNeo and DeepHat both carry additional usage restrictions beyond their base model licenses. Review the model cards before enabling them in production workflows.
+- Ollama model weights are stored in the `ollama-models` Docker volume — no re-download on container restart.
+- `SHANNON_OPENAI_API_KEY` defaults to `dummy` — Ollama does not require auth.
+- WhiteRabbitNeo carries additional usage restrictions beyond its base model license. Review the model card before enabling in production workflows.
+
+## Alternative: vLLM / AWQ (non-Blackwell hardware only)
+
+> **RTX 50-series warning:** `vllm/vllm-openai:latest` does not ship compiled CUDA kernels for Blackwell (sm_120) and crashes silently before emitting logs. Use the Ollama path above on RTX 5070/5080/5090.
+
+On CUDA 12 / Ampere-Hopper hardware, the `local-llm` profile runs vLLM with AWQ quantization:
+
+```bash
+export HUGGING_FACE_HUB_TOKEN=hf_...
+export SHANNON_PROVIDER=openai_compatible
+export SHANNON_MODEL=Mistral-7B-Instruct-v0.3-AWQ
+COMPOSE_PROFILES=local-llm docker compose up -d sec-llm shannon chimera-core chimera-cli
+```
+
+Available presets via `LOCAL_LLM_PRESET`: `whiterabbit-qwen` (default) · `whiterabbit-13b` · `whiterabbit-llama-8b` · `deephat`.
 
 ## GPU Setup (Pop!_OS + Docker Engine + NVIDIA Container Toolkit)
 
@@ -205,30 +217,19 @@ Confirm Docker can see the GPU:
 docker run --rm --gpus all nvidia/cuda:12.6.0-base-ubuntu24.04 nvidia-smi
 ```
 
-## Option A: Run WhiteRabbitNeo via Ollama (GPU)
+## Ollama (GPU) — quick reference
 
-This repo includes an optional `ollama` profile that runs Ollama with GPU access and persists models in a Docker volume.
-
-Start Ollama:
+See the [Local Security Model Service](#local-security-model-service) section above for the full setup. Quick reference for the GGUF pull commands:
 
 ```bash
-docker compose --profile ollama up -d ollama
-```
+# 13B Q4_K_M (~8 GB VRAM) — recommended for RTX 5070
+docker exec ollama-gpu ollama pull hf.co/bartowski/WhiteRabbitNeo-13B-v1-GGUF:Q4_K_M
 
-Pull the model once:
+# 7B IQ4_XS (~4 GB VRAM) — faster, more headroom
+docker exec ollama-gpu ollama pull hf.co/bartowski/WhiteRabbitNeo-V3-7B-GGUF:IQ4_XS
 
-```bash
-docker exec -it ollama-gpu ollama pull whiterabbitneo
-```
-
-Point Shannon at Ollama's OpenAI-compatible endpoint:
-
-```bash
-export SHANNON_PROVIDER=openai_compatible
-export SHANNON_MODEL=whiterabbitneo
-export SHANNON_OPENAI_BASE_URL=http://ollama:11434/v1
-export SHANNON_OPENAI_API_KEY=dummy
-docker compose up -d shannon chimera-core chimera-ui chimera-cli
+# Confirm loaded models and exact name for SHANNON_MODEL
+docker exec ollama-gpu ollama list
 ```
 
 ## Optional Lab Targets
