@@ -117,8 +117,10 @@ export HUGGING_FACE_HUB_TOKEN=hf_...
 export LOCAL_LLM_PRESET=whiterabbit-qwen
 export SHANNON_PROVIDER=openai_compatible
 export SHANNON_MODEL=Mistral-7B-Instruct-v0.3-AWQ
-docker compose --profile local-llm up -d sec-llm shannon chimera-core chimera-ui chimera-cli
+COMPOSE_PROFILES=local-llm docker compose up -d sec-llm shannon chimera-core chimera-ui chimera-cli
 ```
+
+> **Compose v5 note:** `--profile` flags combined with explicit service names trigger a validation bug in Docker Compose v5 (`no such service`). Use `COMPOSE_PROFILES=` as an environment variable instead — it is evaluated before service name resolution.
 
 Switch presets without changing Chimera (set `SHANNON_MODEL` to match the served model name):
 
@@ -162,6 +164,7 @@ Install Docker Engine (native `docker.io`, not Docker Desktop):
 sudo apt update
 sudo apt install -y docker.io
 sudo usermod -aG docker "$USER"
+newgrp docker   # activates group in current shell; no logout needed
 ```
 
 Install NVIDIA Container Toolkit and configure Docker runtime (Ubuntu 24.04 Noble / Pop!_OS 24.04):
