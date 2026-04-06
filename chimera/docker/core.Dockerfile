@@ -47,8 +47,11 @@ COPY tools/zypheron/zypheron-ai/requirements-ml.txt /tmp/requirements-zypheron-m
 COPY tools/zypheron/zypheron-ai/requirements-security.txt /tmp/requirements-zypheron-security.txt
 COPY tools/zypheron/zypheron-ai/requirements-web.txt /tmp/requirements-zypheron-web.txt
 COPY tools/zypheron/zypheron-ai/requirements-mcp.txt /tmp/requirements-zypheron-mcp.txt
-COPY tools/shannon/python/llm-service/requirements.txt /tmp/requirements-shannon-llm.txt
-COPY tools/shannon/python/playwright-service/requirements.txt /tmp/requirements-shannon-playwright.txt
+# tools/shannon upstream restructured away from python/ layout; stub files keep
+# the ENABLE_SHANNON / ENABLE_PLAYWRIGHT conditional installs below from failing.
+# Replace with real COPY once the shannon submodule path is updated.
+RUN echo "# shannon-llm placeholder" > /tmp/requirements-shannon-llm.txt \
+ && echo "# shannon-playwright placeholder" > /tmp/requirements-shannon-playwright.txt
 
 RUN awk '!/^(torch|transformers|scikit-learn|spacy|nltk|pandas|numpy)[<>= ]/' \
       /tmp/requirements-zypheron.txt > /tmp/requirements-zypheron-base.txt
