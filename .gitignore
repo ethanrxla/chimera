@@ -217,6 +217,7 @@ __marimo__/
 
 # Project specific
 .env
+PAT
 kali_data/
 .claude/
 docker-compose.yml.bak
