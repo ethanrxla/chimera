@@ -46,29 +46,17 @@ impl ApiClient {
         rate_limit_rps: u16,
         timeout_s: u16,
     ) -> Result<RunCreationResponse> {
-        if pipeline == "recon" {
-            let payload = json!({
-                "scope_text": scope_text,
-                "live": true,
-                "live_confirm": "I UNDERSTAND",
-                "program_name": program_name,
-                "rate_limit_rps": rate_limit_rps,
-                "timeout_s": timeout_s,
-                "max_workers": max_workers,
-            });
-            self.post_json("/recon/run", &payload).await
-        } else {
-            let payload = json!({
-                "scope_text": scope_text,
-                "live": true,
-                "live_confirm": "I UNDERSTAND",
-                "program_name": program_name,
-                "rate_limit_rps": rate_limit_rps,
-                "per_task_timeout_s": timeout_s,
-                "max_workers": max_workers,
-            });
-            self.post_json("/runs", &payload).await
-        }
+        let payload = json!({
+            "scope_text": scope_text,
+            "live": true,
+            "live_confirm": "I UNDERSTAND",
+            "program_name": program_name,
+            "pipeline": pipeline,
+            "rate_limit_rps": rate_limit_rps,
+            "per_task_timeout_s": timeout_s,
+            "max_workers": max_workers,
+        });
+        self.post_json("/runs", &payload).await
     }
 
     pub async fn events_tail(&self, run_id: &str, limit: usize) -> Result<Vec<String>> {
@@ -115,7 +103,8 @@ impl ApiClient {
     }
 
     pub async fn suggested_actions(&self, run_id: &str) -> Result<Value> {
-        self.get_json(&format!("/runs/{run_id}/suggested_actions"))
+        let encoded = urlencoding::encode("suggested_actions.json");
+        self.get_json(&format!("/runs/{run_id}/artifacts/{encoded}"))
             .await
     }
 
