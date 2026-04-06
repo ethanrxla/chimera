@@ -167,6 +167,19 @@ sudo usermod -aG docker "$USER"
 newgrp docker   # activates group in current shell; no logout needed
 ```
 
+If you previously used Docker Desktop or migrated from WSL2, remove the stale credential helper it leaves in `~/.docker/config.json` — native Docker Engine has no `docker-credential-desktop` binary and every `docker pull` will fail with `error getting credentials`:
+
+```bash
+python3 -c "
+import json, pathlib
+p = pathlib.Path.home() / '.docker/config.json'
+c = json.loads(p.read_text())
+c.pop('credsStore', None)
+p.write_text(json.dumps(c, indent='\t'))
+print('removed credsStore, done')
+"
+```
+
 Install NVIDIA Container Toolkit and configure Docker runtime (Ubuntu 24.04 Noble / Pop!_OS 24.04):
 
 ```bash
