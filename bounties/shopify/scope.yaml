@@ -1,0 +1,96 @@
+# Shopify HackerOne scope manifest for Chimera.
+# Replace placeholders before running any live scan.
+
+allowlist:
+  - "https://accounts.shopify.com"
+  - "https://admin.shopify.com"
+  - "https://partners.shopify.com"
+  - "https://shop.app"
+  - "https://checkout.shopify.com"
+  - "https://REPLACE_WITH_ATTACKER_STORE.myshopify.com"
+  - "https://REPLACE_WITH_VICTIM_STORE.myshopify.com"
+
+denylist:
+  # Do not test third-party identity/payment/infrastructure providers directly unless separately in scope.
+  - "accounts.google.com"
+  - "login.microsoftonline.com"
+  - "appleid.apple.com"
+  - "facebook.com"
+  - "stripe.com"
+  - "paypal.com"
+  # Do not add or scan real merchant stores. Only the two owned store placeholders
+  # above should be replaced with live myshopify.com targets.
+
+rate_limits:
+  requests_per_second: 2
+  concurrency: 2
+  max_requests_per_scan: 1000
+
+allowed_methods:
+  - "GET"
+  - "HEAD"
+  - "OPTIONS"
+  - "POST"
+  - "PUT"
+  - "PATCH"
+  - "DELETE"
+
+tool_settings:
+  strix:
+    crawl_depth: 2
+    follow_redirects: true
+    check_robots_txt: true
+
+  zypheron:
+    aggressive_mode: false
+    subdomain_bruteforce: false
+    port_scan_range: "none"
+
+  vibepentester:
+    aggressive_mode: false
+    enable_sqlmap: false
+    enable_fuzzing: false
+
+  autoswagger:
+    auth_header: "Authorization"
+    auth_scheme: "Bearer"
+
+context:
+  program: "Shopify"
+  platform: "HackerOne"
+  campaign_asset: "Authentication & ATO"
+  campaign_window: "2026-06-08 to 2026-06-26"
+  safety:
+    owned_accounts_only: true
+    owned_stores_only: true
+    no_live_merchants: true
+    no_contacting_support: true
+    allow_destructive: false
+  validation_inputs:
+    attacker_account:
+      email: "YOURHANDLE+shopify-a@wearehackerone.com"
+      store: "REPLACE_WITH_ATTACKER_STORE.myshopify.com"
+      partner_org: "REPLACE_WITH_PARTNER_ORG_A"
+      headers:
+        Cookie: "REPLACE_WITH_ACCOUNT_A_COOKIE"
+        Authorization: "Bearer REPLACE_WITH_ACCOUNT_A_TOKEN"
+    victim_account:
+      email: "YOURHANDLE+shopify-b@wearehackerone.com"
+      store: "REPLACE_WITH_VICTIM_STORE.myshopify.com"
+      partner_org: "REPLACE_WITH_PARTNER_ORG_B"
+      headers:
+        Cookie: "REPLACE_WITH_ACCOUNT_B_COOKIE"
+        Authorization: "Bearer REPLACE_WITH_ACCOUNT_B_TOKEN"
+    target_objects:
+      account_id: "REPLACE_WITH_VICTIM_ACCOUNT_ID"
+      shop_id: "REPLACE_WITH_VICTIM_SHOP_ID"
+      organization_id: "REPLACE_WITH_VICTIM_ORG_ID"
+      session_id: "REPLACE_WITH_VICTIM_SESSION_ID"
+      mfa_factor_id: "REPLACE_WITH_VICTIM_MFA_FACTOR_ID"
+      oauth_grant_id: "REPLACE_WITH_VICTIM_OAUTH_GRANT_ID"
+
+# Shannon/oracle context:
+# 1. Prioritize auth/account takeover surfaces eligible for the campaign multiplier.
+# 2. Test BOLA/IDOR by swapping owned Account B object IDs into Account A authenticated requests.
+# 3. Verify token audience, shop, org, user, session, and MFA challenge binding.
+# 4. Reject findings that are enumeration-only, OAuth hygiene-only, or scanner-only.
