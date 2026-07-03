@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Dict, Optional
 from urllib.parse import quote
 
@@ -15,11 +18,19 @@ class PersistentBrowserSession:
     headless: bool = True
     auth_cookies: Dict[str, str] = field(default_factory=dict)
     playwright_factory: Optional[Any] = None
+    session_id: str = ""
+    artifacts_dir: Optional[str] = None
+    observable: bool = False
 
     def __post_init__(self) -> None:
         self._automation: Optional[BrowserAutomation] = None
         self._lock = asyncio.Lock()
         self._current_url = self.target
+        self._capture_index = 0
+        self._last_capture: Dict[str, Any] = {}
+        self._artifacts_path = Path(self.artifacts_dir) if self.artifacts_dir else None
+        if self._artifacts_path is not None:
+            self._artifacts_path.mkdir(parents=True, exist_ok=True)
 
     async def analyze(self, url: Optional[str] = None) -> Dict[str, Any]:
         task = BrowserTask(
@@ -36,7 +47,9 @@ class PersistentBrowserSession:
             automation = await self._ensure_started(url=url)
             task_to_run = self._normalized_task(task, url=url)
             artifacts = await automation.execute_task(task_to_run)
+            artifacts = self._persist_capture(artifacts, task_to_run)
             self._current_url = artifacts.get("url") or url or self._current_url
+            self._last_capture = artifacts
             return artifacts
 
     async def trace_xss(self, *, url: Optional[str], parameter: str, payload: str) -> Dict[str, Any]:
@@ -86,6 +99,47 @@ class PersistentBrowserSession:
             if self._automation is not None:
                 await self._automation.close()
                 self._automation = None
+            self._append_session_event({"event": "close"})
+
+    async def get_console(self, *, limit: int = 200) -> Dict[str, Any]:
+        async with self._lock:
+            console = list(self._last_capture.get("console") or [])
+            if limit > 0:
+                console = console[-limit:]
+            return {
+                "session_id": self.session_id,
+                "count": len(console),
+                "console": console,
+                "artifact_ref": self._last_capture.get("console_artifact_ref"),
+                "capture_artifact_ref": self._last_capture.get("capture_artifact_ref"),
+            }
+
+    async def get_network(self, *, limit: int = 200) -> Dict[str, Any]:
+        async with self._lock:
+            network = list(self._last_capture.get("network") or [])
+            if limit > 0:
+                network = network[-limit:]
+            return {
+                "session_id": self.session_id,
+                "count": len(network),
+                "network": network,
+                "artifact_ref": self._last_capture.get("network_artifact_ref"),
+                "capture_artifact_ref": self._last_capture.get("capture_artifact_ref"),
+            }
+
+    async def get_latest_capture(self) -> Dict[str, Any]:
+        async with self._lock:
+            return dict(self._last_capture)
+
+    async def get_screenshot_bytes(self) -> bytes | None:
+        async with self._lock:
+            screenshot_ref = str(self._last_capture.get("screenshot_artifact_ref") or "")
+            if not screenshot_ref or self._artifacts_path is None:
+                return None
+            screenshot_path = self._artifacts_path / Path(screenshot_ref).name
+            if not screenshot_path.exists():
+                return None
+            return screenshot_path.read_bytes()
 
     async def _ensure_started(self, *, url: Optional[str] = None) -> BrowserAutomation:
         if self._automation is None:
@@ -113,3 +167,77 @@ class PersistentBrowserSession:
             extract_console=task.extract_console,
             context=dict(task.context),
         )
+
+    def _persist_capture(self, artifacts: Dict[str, Any], task: BrowserTask) -> Dict[str, Any]:
+        self._capture_index += 1
+        capture = dict(artifacts)
+        capture.setdefault("browser_session_id", self.session_id or None)
+        capture.setdefault("observable", self.observable)
+
+        if self._artifacts_path is None:
+            return capture
+
+        capture_stem = f"capture_{self._capture_index:04d}"
+
+        page_source = str(capture.get("page_source") or "")
+        if page_source:
+            page_source_name = f"{capture_stem}.html"
+            (self._artifacts_path / page_source_name).write_text(page_source, encoding="utf-8")
+            capture["page_source_artifact_ref"] = page_source_name
+
+        console = capture.get("console")
+        if isinstance(console, list):
+            console_name = f"{capture_stem}_console.json"
+            (self._artifacts_path / console_name).write_text(json.dumps(console, indent=2), encoding="utf-8")
+            capture["console_artifact_ref"] = console_name
+
+        network = capture.get("network")
+        if isinstance(network, list):
+            network_name = f"{capture_stem}_network.json"
+            (self._artifacts_path / network_name).write_text(json.dumps(network, indent=2), encoding="utf-8")
+            capture["network_artifact_ref"] = network_name
+
+        screenshot_hex = str(capture.get("screenshot") or "")
+        if screenshot_hex:
+            screenshot_name = f"{capture_stem}.png"
+            try:
+                (self._artifacts_path / screenshot_name).write_bytes(bytes.fromhex(screenshot_hex))
+                capture["screenshot_artifact_ref"] = screenshot_name
+            except ValueError:
+                pass
+
+        capture_payload = {
+            "schema": "chimera.browser_capture.v1",
+            "session_id": self.session_id,
+            "captured_at": datetime.now(timezone.utc).isoformat(),
+            "observable": self.observable,
+            "headless": self.headless,
+            "task": task.model_dump() if hasattr(task, "model_dump") else dict(task),
+            "capture": capture,
+        }
+        capture_name = f"{capture_stem}.json"
+        (self._artifacts_path / capture_name).write_text(json.dumps(capture_payload, indent=2), encoding="utf-8")
+        capture["capture_artifact_ref"] = capture_name
+        self._append_session_event(
+            {
+                "event": "capture",
+                "capture_artifact_ref": capture_name,
+                "url": capture.get("url"),
+                "status_code": capture.get("status_code"),
+                "screenshot_artifact_ref": capture.get("screenshot_artifact_ref"),
+            }
+        )
+        return capture
+
+    def _append_session_event(self, payload: Dict[str, Any]) -> None:
+        if self._artifacts_path is None:
+            return
+        event = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "session_id": self.session_id,
+            **payload,
+        }
+        events_path = self._artifacts_path / "session_events.jsonl"
+        with events_path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(event))
+            handle.write("\n")

@@ -1,4 +1,5 @@
 import json
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -53,6 +54,12 @@ class RunStore:
     def _run_file(self, run_id: str) -> Path:
         return self._run_dir(run_id) / "run.json"
 
+    def _write_json_atomic(self, path: Path, data: Dict[str, Any]) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = path.with_suffix(path.suffix + ".tmp")
+        tmp_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        tmp_path.replace(path)
+
     def create_run(
         self,
         run_id: str,
@@ -85,7 +92,7 @@ class RunStore:
                 "exploit_chains": 0,
             },
         }
-        self._run_file(run_id).write_text(json.dumps(data, indent=2), encoding="utf-8")
+        self._write_json_atomic(self._run_file(run_id), data)
         return RunRecord(run_id=run_id, data=data)
 
     def update_run(self, run_id: str, **updates: Any) -> RunRecord:
@@ -97,13 +104,27 @@ class RunStore:
             data["started_at"] = _now()
         if status in {"completed", "failed", "cancelled"} and not data.get("ended_at"):
             data["ended_at"] = _now()
-        self._run_file(run_id).write_text(json.dumps(data, indent=2), encoding="utf-8")
+        self._write_json_atomic(self._run_file(run_id), data)
         return RunRecord(run_id=run_id, data=data)
 
     def get_run(self, run_id: str) -> RunRecord:
         path = self._run_file(run_id)
         if not path.exists():
             raise FileNotFoundError(f"Run not found: {run_id}")
+        last_error: json.JSONDecodeError | None = None
+        for _ in range(5):
+            raw = path.read_text(encoding="utf-8")
+            if not raw.strip():
+                time.sleep(0.01)
+                continue
+            try:
+                data = json.loads(raw)
+                return RunRecord(run_id=run_id, data=data)
+            except json.JSONDecodeError as exc:
+                last_error = exc
+                time.sleep(0.01)
+        if last_error is not None:
+            raise last_error
         data = json.loads(path.read_text(encoding="utf-8"))
         return RunRecord(run_id=run_id, data=data)
 

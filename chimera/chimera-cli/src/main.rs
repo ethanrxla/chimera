@@ -16,7 +16,8 @@ use crate::api::ApiClient;
 use crate::app::{App, ConsoleSnapshot};
 use crate::config::{build_scope_text, load_state, read_scope_file, save_state};
 use crate::models::{
-    default_api_base, ChainFinding, CliState, FindingSummary, SafetyState, StatusResponse,
+    default_api_base, default_ollama_base, ChainFinding, CliState, FindingSummary, SafetyState,
+    StatusResponse,
 };
 use crate::nlp::interpret_payload;
 use crate::render::{render_chain_ascii, render_chain_detail, render_status_block, stat_u64};
@@ -54,6 +55,8 @@ impl Pipeline {
 struct Cli {
     #[arg(long, env = "CHIMERA_API_BASE", default_value_t = default_api_base())]
     api_base: String,
+    #[arg(long, env = "OLLAMA_BASE_URL", default_value_t = default_ollama_base())]
+    ollama_base: String,
     #[arg(long, global = true)]
     target: Option<String>,
     #[arg(long, global = true)]
@@ -106,6 +109,12 @@ enum Commands {
         run: Option<String>,
         question: String,
     },
+    Models,
+    Chat {
+        prompt: String,
+        #[arg(long)]
+        model: Option<String>,
+    },
     Ghost {
         #[arg(long)]
         run: Option<String>,
@@ -136,7 +145,12 @@ async fn main() -> Result<()> {
     } else {
         cli.api_base.clone()
     };
-    let client = ApiClient::new(api_base.clone())?;
+    let ollama_base = if cli.ollama_base == default_ollama_base() {
+        state.ollama_base.clone()
+    } else {
+        cli.ollama_base.clone()
+    };
+    let client = ApiClient::new(api_base.clone(), ollama_base.clone())?;
 
     let command = match (
         cli.command.clone(),
@@ -180,7 +194,7 @@ async fn main() -> Result<()> {
             println!("run_id: {}", resolved_run);
         }
         Commands::Console => {
-            run_console_shell(&client, &mut state, &api_base, &cli).await?;
+            run_console_shell(&client, &mut state, &api_base, &ollama_base, &cli).await?;
         }
         Commands::Status => {
             let status = client.status().await?;
@@ -274,6 +288,18 @@ async fn main() -> Result<()> {
                 serde_json::to_string_pretty(&payload).unwrap_or_else(|_| "{}".to_string())
             );
         }
+        Commands::Models => {
+            for model in client.ollama_models().await? {
+                println!("{}", model);
+            }
+        }
+        Commands::Chat { prompt, model } => {
+            let model = model
+                .or_else(|| state.ollama_model.clone())
+                .unwrap_or_else(|| "whiterabbitneo-13b".to_string());
+            let reply = client.ollama_chat(&model, &prompt).await?;
+            println!("[{}]\n{}", model, reply);
+        }
         Commands::Ghost { run } => {
             let run_id = resolve_run_id(run, &state)?;
             let artifacts = client.artifacts(&run_id).await?;
@@ -293,6 +319,7 @@ async fn run_console_shell(
     client: &ApiClient,
     state: &mut CliState,
     api_base: &str,
+    ollama_base: &str,
     cli: &Cli,
 ) -> Result<()> {
     if !run_startup_splash()? {
@@ -307,6 +334,8 @@ async fn run_console_shell(
             .clone()
             .unwrap_or_else(|| cli.pipeline.as_api_value().to_string()),
         state.last_program.clone(),
+        ollama_base.to_string(),
+        state.ollama_model.clone(),
     );
     app.push_output("Hybrid operator console online.");
     app.push_output("Normal mode handles navigation. Use : for commands and / for NLP.");
@@ -337,7 +366,9 @@ async fn run_console_shell(
     }
 
     state.api_base = api_base.to_string();
+    state.ollama_base = ollama_base.to_string();
     state.last_target = app.target.clone();
+    state.ollama_model = Some(app.ollama_model.clone());
     state.last_run_id = app
         .selected_run_id
         .clone()
@@ -510,6 +541,31 @@ fn handle_console_effect(
                 handle.block_on(client.shannon_oracle(&question, target))
             })?;
             append_oracle_preview(app, &payload);
+            Ok(None)
+        }
+        Effect::FetchOllamaModels => {
+            let models = tokio::task::block_in_place(|| {
+                let handle = tokio::runtime::Handle::current();
+                handle.block_on(client.ollama_models())
+            })?;
+            app.push_output("Installed Ollama models:");
+            for model in models {
+                app.push_output(format!("- {}", model));
+            }
+            app.set_status("Ollama models loaded", false);
+            Ok(None)
+        }
+        Effect::FetchOllamaChat(prompt) => {
+            let model = app.ollama_model.clone();
+            let reply = tokio::task::block_in_place(|| {
+                let handle = tokio::runtime::Handle::current();
+                handle.block_on(client.ollama_chat(&model, &prompt))
+            })?;
+            app.push_output(format!("[{}]", model));
+            for line in reply.lines() {
+                app.push_output(line.to_string());
+            }
+            app.set_status("Ollama reply received", false);
             Ok(None)
         }
         Effect::InterpretNlp(text) => {

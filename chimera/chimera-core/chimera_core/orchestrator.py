@@ -1,6 +1,7 @@
 import hashlib
 import os
 import uuid
+import json
 import yaml
 from datetime import datetime, timezone
 from pathlib import Path
@@ -14,6 +15,7 @@ from chimera_core.runner import PlanRunner
 from chimera_core.run_manager import RunManager
 from chimera_core.runtime import Runtime, RuntimeCancelledError
 from chimera_core.run_store import RunStore
+from chimera_core.reconciliation import reconcile_run
 from chimera_core.scope import normalize_scope
 from chimera_core.config import load_config
 from chimera_core.sinks.local import LocalSink
@@ -55,6 +57,35 @@ class Orchestrator:
         else:
             event_sink.emit(event)
 
+    def _verification_stats_from_events(self, events_path: Path) -> Dict[str, int]:
+        stats = {
+            "verification_passed": 0,
+            "verification_failed": 0,
+            "verification_skipped_cache_hits": 0,
+            "verification_artifacts": 0,
+        }
+        if not events_path.exists():
+            return stats
+        for raw_line in events_path.read_text(encoding="utf-8").splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            event_type = event.get("event_type")
+            payload = event.get("payload") or {}
+            if event_type == "verification_passed":
+                stats["verification_passed"] += 1
+            elif event_type == "verification_failed":
+                stats["verification_failed"] += 1
+            elif event_type == "verification_skipped" and payload.get("reason") == "cache_hit":
+                stats["verification_skipped_cache_hits"] += 1
+            if payload.get("verification_result_ref"):
+                stats["verification_artifacts"] += 1
+        return stats
+
     def create_job(self, scope_file: str, mode: str) -> Job:
         """
         Creates and registers a new job from a scope file.
@@ -92,7 +123,7 @@ class Orchestrator:
         print(f"[Orchestrator] Created job {job_id} with status {job.status.value}")
         return job
 
-    def start_run(self, job_id: str, event_sink: Optional[Any] = None, cancel_event: Optional[Any] = None):
+    def start_run(self, job_id: str, event_sink: Optional[Any] = None, cancel_event: Optional[Any] = None, on_run_id_known: Optional[Any] = None):
         """
         Executes the full agentic pipeline for a given job.
         """
@@ -161,6 +192,9 @@ class Orchestrator:
                 },
                 status="created",
             )
+            # Fire callback immediately so event streaming works during the run.
+            if on_run_id_known:
+                on_run_id_known(run.run_id, run.artifacts_dir)
             local_sink = LocalSink(run.artifacts_dir, run.run_id)
             sink = local_sink
             config = load_config()
@@ -187,7 +221,7 @@ class Orchestrator:
             allowed_binaries = None
             extra_binaries = config.get("shannon", {}).get("allowed_binaries") or []
             if extra_binaries:
-                allowed_binaries = {"python", "python3", "autoswagger", "strix", "curl"}
+                allowed_binaries = {"python", "python3", "autoswagger", "strix", "zap", "curl"}
                 allowed_binaries.update({str(name).lower() for name in extra_binaries})
             safety_policy = SafetyPolicy(
                 allow_external_execution=self.live,
@@ -255,7 +289,7 @@ class Orchestrator:
             runner = PlanRunner(
                 runtime=runtime,
                 max_workers=self.max_workers,
-                stop_on_fail=False if self.live else self.stop_on_fail,
+                stop_on_fail=self.stop_on_fail,
                 fixture_registry=self.fixture_registry,
             )
             results = runner.execute(plan)
@@ -283,6 +317,7 @@ class Orchestrator:
             for finding in deduped:
                 sink.emit_finding(finding)
             local_sink.flush()
+            verification_stats = self._verification_stats_from_events(run.artifacts_dir / "events.jsonl")
             run_store.update_run(
                 run.run_id,
                 status=run_status,
@@ -293,6 +328,7 @@ class Orchestrator:
                     "findings_total": len(deduped),
                     "duplicates": duplicates,
                     "exploit_chains": len([finding for finding in deduped if finding.finding_type == "EXPLOIT_CHAIN"]),
+                    **verification_stats,
                 },
             )
             if local_sink.report_artifacts:
@@ -336,10 +372,28 @@ class Orchestrator:
             for finding in deduped:
                 self._emit_event(event_sink, "finding_created", {"job_id": job_id, "finding": finding.to_dict()})
 
+            reconciliation = reconcile_run(
+                run_id=run.run_id,
+                artifacts_dir=run.artifacts_dir,
+                expected_status=run_status,
+                failed_tasks=[result.task_id for result in failed_results],
+                findings_total=len(deduped),
+            )
+            sink.emit_event(
+                {
+                    "event_type": "run_reconciled",
+                    "payload": reconciliation,
+                }
+            )
+            run_status = str(reconciliation["effective_status"])
             job.status = JobStatus.COMPLETED if not failed_results else JobStatus.FAILED
+            if run_status != "completed":
+                job.status = JobStatus.FAILED
             job.ended_at = datetime.now(timezone.utc)
             if sink:
                 final_event = "run_finished" if not failed_results else "run_failed"
+                if run_status != "completed":
+                    final_event = "run_failed"
                 sink.emit_event(
                     {
                         "event_type": final_event,
@@ -347,11 +401,12 @@ class Orchestrator:
                             "run_id": run.run_id,
                             "job_id": job_id,
                             "failed_tasks": [result.task_id for result in failed_results],
+                            "reconciliation": reconciliation,
                         },
                     }
                 )
                 sink.flush()
-            terminal_event = "run_finished" if not failed_results else "run_failed"
+            terminal_event = "run_finished" if run_status == "completed" else "run_failed"
             self._emit_event(event_sink, terminal_event, {"job_id": job_id, "status": job.status.value})
             print(f"[Orchestrator] Job {job_id} completed with status {job.status.value}")
             print(f"[Orchestrator] Findings: {len(deduped)} (deduped {duplicates})")

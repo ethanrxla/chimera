@@ -196,6 +196,10 @@ pub struct ChainFinding {
 pub struct CliState {
     #[serde(default = "default_api_base")]
     pub api_base: String,
+    #[serde(default = "default_ollama_base")]
+    pub ollama_base: String,
+    #[serde(default)]
+    pub ollama_model: Option<String>,
     #[serde(default)]
     pub last_target: Option<String>,
     #[serde(default)]
@@ -210,4 +214,8 @@ pub struct CliState {
 
 pub fn default_api_base() -> String {
     "http://127.0.0.1:8000/v1".to_string()
+}
+
+pub fn default_ollama_base() -> String {
+    "http://127.0.0.1:11434".to_string()
 }

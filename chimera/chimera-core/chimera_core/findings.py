@@ -41,6 +41,7 @@ class Finding:
     proof_artifacts: List[Dict[str, Any]] = field(default_factory=list)
     sink: Optional[str] = None
     replay_steps: List[Dict[str, Any]] = field(default_factory=list)
+    exploit_status: Optional[str] = None
 
     def to_dict(self):
         payload = {
@@ -82,6 +83,8 @@ class Finding:
             payload["sink"] = self.sink
         if self.replay_steps:
             payload["replay_steps"] = self.replay_steps
+        if self.exploit_status:
+            payload["exploit_status"] = self.exploit_status
         return payload
 
     def to_chain_summary(self) -> str:

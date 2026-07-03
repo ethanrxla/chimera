@@ -43,6 +43,12 @@
       "enabled": true,
       "type": "python",
       "entrypoint": ["python", "-m", "playwright"]
+    },
+    "hexstrike": {
+      "enabled": true,
+      "type": "http",
+      "http_endpoint": "hexstrike:8888",
+      "binary": null
     }
   }
 }

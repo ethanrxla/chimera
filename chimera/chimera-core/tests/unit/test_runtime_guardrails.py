@@ -50,6 +50,10 @@ def test_runtime_blocks_target_override(runtime, monkeypatch):
     command = ["curl", "https://example.com", "https://evil.com"]
     with pytest.raises(ValueError, match="Target out of scope"):
         runtime.run_cmd(command)
+    events = list(runtime.event_store.replay())
+    violations = [event for event in events if event.get("event_type") == "scope_violation"]
+    assert violations
+    assert violations[0]["payload"]["rejected_targets"] == ["https://evil.com"]
 
 
 def test_runtime_blocks_private_ip_resolution(tmp_path, monkeypatch):
@@ -97,9 +101,10 @@ def test_runtime_truncates_output_and_emits_event(runtime, monkeypatch):
     _mock_public_dns(monkeypatch)
     runtime._execute_subprocess = Mock(return_value=Mock(stdout="x" * 200, stderr="", returncode=0))
     runtime.run_cmd(["python", "-c", "print('hello')"])
-    events = runtime.event_store.replay()
+    events = list(runtime.event_store.replay())
     payloads = [event for event in events if event.get("event_type") == "output_truncated"]
     assert payloads
+    assert all("event_id" in event and "seq" in event and "source" in event for event in events)
 
 
 def test_runtime_emits_run_limit_warning(runtime, monkeypatch):

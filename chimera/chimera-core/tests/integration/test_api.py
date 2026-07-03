@@ -217,6 +217,155 @@ async def test_api_artifact_download(tmp_path: Path):
 
 
 @pytest.mark.anyio
+async def test_policy_evaluate_allows_get_defers_post_and_denies_out_of_scope():
+    app = create_app(testing=True)
+    async with _make_client(app) as client:
+        payload = {
+            "tool": "hexstrike",
+            "target": "https://app.example.com/api/events",
+            "method": "GET",
+            "action_class": "low_impact",
+            "risk_class": "low_impact",
+            "scope_summary": {
+                "allowlist": ["https://app.example.com"],
+                "denylist": [],
+                "allowed_methods": ["GET", "HEAD", "OPTIONS", "POST"],
+            },
+        }
+        allow_resp = await client.post("/v1/policy/evaluate", json=payload)
+        assert allow_resp.status_code == 200
+        assert allow_resp.json()["decision"]["decision"] == "allow"
+
+        payload["method"] = "POST"
+        payload["action_class"] = "state_changing"
+        payload["risk_class"] = "state_changing"
+        defer_resp = await client.post("/v1/policy/evaluate", json=payload)
+        assert defer_resp.status_code == 200
+        assert defer_resp.json()["decision"]["decision"] == "defer"
+
+        payload["target"] = "https://evil.example.net/api/events"
+        deny_resp = await client.post("/v1/policy/evaluate", json=payload)
+        assert deny_resp.status_code == 200
+        assert deny_resp.json()["decision"]["decision"] == "deny"
+
+
+@pytest.mark.anyio
+async def test_policy_evaluate_distinguishes_passive_and_active_zap():
+    app = create_app(testing=True)
+    async with _make_client(app) as client:
+        passive = {
+            "tool": "zap",
+            "target": "https://app.example.com",
+            "action_class": "passive",
+            "risk_class": "passive",
+            "scope_summary": {"allowlist": ["https://app.example.com"], "denylist": []},
+        }
+        passive_resp = await client.post("/v1/policy/evaluate", json=passive)
+        assert passive_resp.status_code == 200
+        assert passive_resp.json()["decision"]["decision"] == "allow"
+
+        active = dict(passive)
+        active["action_class"] = "active_scan"
+        active["risk_class"] = "active_scan"
+        active_resp = await client.post("/v1/policy/evaluate", json=active)
+        assert active_resp.status_code == 200
+        assert active_resp.json()["decision"]["decision"] == "defer"
+
+        terminal = {
+            "tool": "terminal",
+            "target": "https://app.example.com",
+            "action_class": "low_impact",
+            "risk_class": "low_impact",
+            "command": ["bash"],
+            "scope_summary": {"allowlist": ["https://app.example.com"], "denylist": []},
+        }
+        terminal_resp = await client.post("/v1/policy/evaluate", json=terminal)
+        assert terminal_resp.status_code == 200
+        assert terminal_resp.json()["decision"]["decision"] == "allow"
+
+
+@pytest.mark.anyio
+async def test_zap_sites_and_alerts_routes_use_policy_and_proxy(monkeypatch):
+    app = create_app(testing=True)
+
+    async def fake_zap_api_get(path: str, *, params: dict[str, object]):
+        if path.endswith("/sites/"):
+            return {"sites": ["https://app.example.com", "https://admin.example.com"]}
+        if path.endswith("/alerts/"):
+            return {"alerts": [{"name": "X-Frame-Options Header Not Set", "risk": "Medium"}]}
+        raise AssertionError(f"unexpected path {path}")
+
+    monkeypatch.setattr("chimera_core.api.routes._zap_api_get", fake_zap_api_get)
+
+    async with _make_client(app) as client:
+        payload = {"target": "https://app.example.com", "scope_summary": {"allowlist": ["https://app.example.com"], "denylist": []}}
+        sites_resp = await client.post("/v1/zap/sites", json=payload)
+        assert sites_resp.status_code == 200
+        assert sites_resp.json()["count"] == 1
+        assert sites_resp.json()["sites"] == ["https://app.example.com"]
+
+        alerts_resp = await client.post("/v1/zap/alerts", json=payload)
+        assert alerts_resp.status_code == 200
+        assert alerts_resp.json()["count"] == 1
+        assert alerts_resp.json()["alerts"][0]["name"] == "X-Frame-Options Header Not Set"
+
+
+@pytest.mark.anyio
+async def test_zap_spider_route_returns_scan_metadata(monkeypatch):
+    app = create_app(testing=True)
+
+    async def fake_zap_api_get(path: str, *, params: dict[str, object]):
+        if path.endswith("/scan/"):
+            return {"scan": "3"}
+        if path.endswith("/status/"):
+            return {"status": "17"}
+        if path.endswith("/results/"):
+            return {"results": ["https://app.example.com/app", "https://app.example.com/api/openapi.json"]}
+        raise AssertionError(f"unexpected path {path}")
+
+    monkeypatch.setattr("chimera_core.api.routes._zap_api_get", fake_zap_api_get)
+
+    async with _make_client(app) as client:
+        payload = {
+            "target": "https://app.example.com",
+            "recurse": True,
+            "max_children": 20,
+            "scope_summary": {"allowlist": ["https://app.example.com"], "denylist": []},
+        }
+        spider_resp = await client.post("/v1/zap/spider", json=payload)
+        assert spider_resp.status_code == 200
+        assert spider_resp.json()["scan_id"] == "3"
+        assert spider_resp.json()["status"] == "17"
+        assert spider_resp.json()["results_count"] == 2
+        assert spider_resp.json()["results"][0] == "https://app.example.com/app"
+
+
+@pytest.mark.anyio
+async def test_zap_spider_results_route_returns_results(monkeypatch):
+    app = create_app(testing=True)
+
+    async def fake_zap_api_get(path: str, *, params: dict[str, object]):
+        if path.endswith("/results/"):
+            assert params["scanId"] == "7"
+            return {"results": ["https://app.example.com/app", "https://app.example.com/api/health"]}
+        raise AssertionError(f"unexpected path {path}")
+
+    monkeypatch.setattr("chimera_core.api.routes._zap_api_get", fake_zap_api_get)
+
+    async with _make_client(app) as client:
+        payload = {
+            "scan_id": "7",
+            "limit": 10,
+            "scope_summary": {"allowlist": ["https://app.example.com"], "denylist": []},
+            "target": "https://app.example.com",
+        }
+        results_resp = await client.post("/v1/zap/spider/results", json=payload)
+        assert results_resp.status_code == 200
+        assert results_resp.json()["count"] == 2
+        assert results_resp.json()["results"][1] == "https://app.example.com/api/health"
+
+
+@pytest.mark.anyio
 async def test_api_diff_includes_changed_summary(tmp_path: Path):
     app = create_app(testing=True)
     app.state.artifacts_root = tmp_path / "artifacts"
@@ -512,6 +661,18 @@ async def test_browser_session_endpoints(tmp_path: Path):
         assert get_resp.status_code == 200
         assert get_resp.json()["last_action"] == "trace-xss"
 
+        console_resp = await client.get(f"/v1/browser/sessions/{session_id}/console")
+        assert console_resp.status_code == 200
+        assert "capture_artifact_ref" in console_resp.json()
+
+        network_resp = await client.get(f"/v1/browser/sessions/{session_id}/network")
+        assert network_resp.status_code == 200
+        assert isinstance(network_resp.json()["network"], list)
+
+        screenshot_resp = await client.get(f"/v1/browser/sessions/{session_id}/screenshot")
+        assert screenshot_resp.status_code == 200
+        assert screenshot_resp.headers["content-type"] == "image/png"
+
         delete_resp = await client.delete(f"/v1/browser/sessions/{session_id}")
         assert delete_resp.status_code == 200
 
@@ -533,6 +694,73 @@ async def test_browser_execute_endpoint_runs_task(tmp_path: Path):
         payload = execute_resp.json()
         assert payload["capture"]["url"] == "https://www.example.com/app"
         assert payload["findings"][0]["finding_type"] == "DOM_XSS"
+
+
+@pytest.mark.anyio
+async def test_browser_execute_preserves_current_page_when_url_omitted(tmp_path: Path):
+    app = create_app(testing=True)
+    app.state.artifacts_root = tmp_path / "artifacts"
+    app.state.browser_playwright_factory = fake_browser_factory
+
+    async with _make_client(app) as client:
+        create_resp = await client.post("/v1/browser/sessions", json={"target": "https://www.example.com/app"})
+        session_id = create_resp.json()["session_id"]
+
+        first_resp = await client.post(
+            f"/v1/browser/sessions/{session_id}/execute",
+            json={"task": {"actions": [{"type": "navigate", "url": "https://www.example.com/dashboard"}]}},
+        )
+        assert first_resp.status_code == 200
+        assert first_resp.json()["capture"]["url"] == "https://www.example.com/dashboard"
+
+        second_resp = await client.post(
+            f"/v1/browser/sessions/{session_id}/execute",
+            json={"task": {"actions": [{"type": "extract_dom"}]}},
+        )
+        assert second_resp.status_code == 200
+        assert second_resp.json()["capture"]["url"] == "https://www.example.com/dashboard"
+
+
+@pytest.mark.anyio
+async def test_terminal_session_endpoints(tmp_path: Path):
+    app = create_app(testing=True)
+    app.state.artifacts_root = tmp_path / "artifacts"
+    app.state.runtime_allowlist = ["sh"]
+
+    async with _make_client(app) as client:
+        create_resp = await client.post(
+            "/v1/terminal/sessions",
+            json={
+                "command": ["sh", "-c", "printf ready; cat"],
+                "target": "https://www.example.com",
+                "scope_summary": {"allowlist": ["https://www.example.com"], "denylist": []},
+            },
+        )
+        assert create_resp.status_code == 201
+        session_id = create_resp.json()["session_id"]
+
+        read_resp = await client.post(f"/v1/terminal/sessions/{session_id}/read", json={"timeout_ms": 100})
+        assert read_resp.status_code == 200
+        assert "ready" in read_resp.json()["output"]
+
+        write_resp = await client.post(f"/v1/terminal/sessions/{session_id}/write", json={"data": "hello\n"})
+        assert write_resp.status_code == 200
+        assert write_resp.json()["bytes_written"] >= 1
+
+        echoed_resp = await client.post(f"/v1/terminal/sessions/{session_id}/read", json={"timeout_ms": 100})
+        assert echoed_resp.status_code == 200
+        assert "hello" in echoed_resp.json()["output"]
+
+        resize_resp = await client.post(f"/v1/terminal/sessions/{session_id}/resize", json={"cols": 140, "rows": 42})
+        assert resize_resp.status_code == 200
+        assert resize_resp.json()["cols"] == 140
+
+        get_resp = await client.get(f"/v1/terminal/sessions/{session_id}")
+        assert get_resp.status_code == 200
+        assert get_resp.json()["status"] in {"running", "exited"}
+
+        delete_resp = await client.delete(f"/v1/terminal/sessions/{session_id}")
+        assert delete_resp.status_code == 200
 
 
 @pytest.mark.anyio

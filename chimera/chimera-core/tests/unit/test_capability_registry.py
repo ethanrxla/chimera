@@ -12,3 +12,9 @@ def test_registry_reaches_extra_tools_when_context_matches() -> None:
 
     assert "browser" in web_caps
     assert "subfinder" in subdomain_caps
+
+
+def test_registry_includes_web_app_sequence() -> None:
+    capabilities = get_capabilities_for_target("web_app", {})
+
+    assert capabilities == ["strix", "zap", "hexstrike", "browser", "shannon"]

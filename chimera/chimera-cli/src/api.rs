@@ -10,17 +10,19 @@ use serde_json::{json, Value};
 #[derive(Clone)]
 pub struct ApiClient {
     base: String,
+    ollama_base: String,
     client: Client,
 }
 
 impl ApiClient {
-    pub fn new(base: String) -> Result<Self> {
+    pub fn new(base: String, ollama_base: String) -> Result<Self> {
         let client = Client::builder()
             .timeout(std::time::Duration::from_secs(30))
             .build()
             .context("failed to build HTTP client")?;
         Ok(Self {
             base: base.trim_end_matches('/').to_string(),
+            ollama_base: ollama_base.trim_end_matches('/').to_string(),
             client,
         })
     }
@@ -117,6 +119,56 @@ impl ApiClient {
     pub async fn suggested_actions(&self, run_id: &str) -> Result<Value> {
         self.get_json(&format!("/runs/{run_id}/suggested_actions"))
             .await
+    }
+
+    pub async fn ollama_models(&self) -> Result<Vec<String>> {
+        let response = self
+            .client
+            .get(format!("{}/api/tags", self.ollama_base))
+            .send()
+            .await
+            .context("failed to query Ollama models")?;
+        let response = response
+            .error_for_status()
+            .context("Ollama model list request returned error")?;
+        let payload: Value = response
+            .json()
+            .await
+            .context("failed to decode Ollama model list")?;
+        Ok(payload["models"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|item| item.get("name").and_then(Value::as_str))
+            .map(ToString::to_string)
+            .collect())
+    }
+
+    pub async fn ollama_chat(&self, model: &str, prompt: &str) -> Result<String> {
+        let response = self
+            .client
+            .post(format!("{}/api/chat", self.ollama_base))
+            .json(&json!({
+                "model": model,
+                "stream": false,
+                "messages": [
+                    {"role": "user", "content": prompt}
+                ]
+            }))
+            .send()
+            .await
+            .context("failed to query Ollama chat")?;
+        let response = response
+            .error_for_status()
+            .context("Ollama chat request returned error")?;
+        let payload: Value = response
+            .json()
+            .await
+            .context("failed to decode Ollama chat response")?;
+        payload["message"]["content"]
+            .as_str()
+            .map(ToString::to_string)
+            .ok_or_else(|| anyhow::anyhow!("Ollama response did not include message.content"))
     }
 
     async fn artifact_json<T: DeserializeOwned>(&self, run_id: &str, path: &str) -> Result<T> {

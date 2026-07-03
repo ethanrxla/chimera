@@ -12,6 +12,11 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
     } else {
         theme.success
     };
+    let run_label = app
+        .selected_run_id
+        .as_deref()
+        .map(|run_id| abbreviate(run_id, 12))
+        .unwrap_or_else(|| "none".to_string());
     let content = Paragraph::new(vec![
         Line::from(vec![
             Span::styled(
@@ -28,16 +33,17 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
                     .add_modifier(Modifier::BOLD),
             ),
         ]),
-        Line::from(format!(
-            "Focus: {}   Theme: {}   Model: {}   Workflow: {}",
-            app.focus.label(),
-            app.theme.label(),
-            app.connection_label(),
-            app.workflow.label()
-        )),
         Line::from(vec![
             Span::styled(
                 format!("Target: {}   ", app.target.as_deref().unwrap_or("not set")),
+                Style::default().fg(theme.text),
+            ),
+            Span::styled(
+                format!("Workflow: {}   ", app.workflow.label()),
+                Style::default().fg(theme.text),
+            ),
+            Span::styled(
+                format!("Run: {}   ", run_label),
                 Style::default().fg(theme.text),
             ),
             Span::styled(
@@ -56,4 +62,12 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
     );
 
     frame.render_widget(content, area);
+}
+
+fn abbreviate(value: &str, width: usize) -> String {
+    if value.len() <= width {
+        return value.to_string();
+    }
+    let keep = width.saturating_sub(3);
+    format!("{}...", &value[..keep])
 }

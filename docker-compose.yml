@@ -17,12 +17,14 @@ services:
       - CHIMERA_CACHE_DIR=/cache
       - PYTHONPATH=/app/chimera-core
       - DOCKER_HOST=unix:///var/run/docker.sock
-      - STRIX_LLM=${STRIX_LLM:-openai/gpt-5}
-      - STRIX_IMAGE=${STRIX_IMAGE:-ghcr.io/usestrix/strix-sandbox:0.1.10}
+      - STRIX_LLM=${STRIX_LLM:-openai/gpt-4o-mini}
+      - STRIX_IMAGE=${STRIX_IMAGE:-ghcr.io/usestrix/strix-sandbox:0.1.13}
       - CHIMERA_SHANNON_ENABLED=${CHIMERA_SHANNON_ENABLED:-true}
       - CHIMERA_SHANNON_VERIFY_AVAILABILITY=${CHIMERA_SHANNON_VERIFY_AVAILABILITY:-true}
       - SHANNON_BASE_URL=${SHANNON_BASE_URL:-http://shannon:8080}
       - PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
+      - ZAP_BASE_URL=${ZAP_BASE_URL:-http://zap:8090}
+      - ZAP_API_KEY=${ZAP_API_KEY:-chimera-zap-key}
     env_file:
       - .env
     extra_hosts:
@@ -42,6 +44,7 @@ services:
       - .:/app
     environment:
       - CHIMERA_API_BASE=http://chimera-core:8000/v1
+      - OLLAMA_BASE_URL=http://ollama:11434
     depends_on:
       - chimera-core
     stdin_open: true
@@ -69,17 +72,53 @@ services:
     build:
       context: ./tools/shannon-svc
     container_name: shannon
+    volumes:
+      - ./kali_data/artifacts:/artifacts
     environment:
-      - SHANNON_PROVIDER=${SHANNON_PROVIDER:-anthropic}
+      - SHANNON_PROVIDER=${SHANNON_PROVIDER:-openai_compatible}
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
       - OPENAI_API_KEY=${OPENAI_API_KEY:-}
-      - SHANNON_MODEL=${SHANNON_MODEL:-Mistral-7B-Instruct-v0.3-AWQ}
       - SHANNON_OPENAI_BASE_URL=${SHANNON_OPENAI_BASE_URL:-http://ollama:11434/v1}
       - SHANNON_OPENAI_API_KEY=${SHANNON_OPENAI_API_KEY:-dummy}
+      - SHANNON_AGENT_ARTIFACT_ROOT=${SHANNON_AGENT_ARTIFACT_ROOT:-/artifacts}
+      - CHIMERA_ARTIFACTS_ROOT=${CHIMERA_ARTIFACTS_ROOT:-/artifacts}
+      - SHANNON_PLANNER_MODEL=${SHANNON_PLANNER_MODEL:-qwen2.5-coder:7b}
+      - SHANNON_EXECUTOR_MODEL=${SHANNON_EXECUTOR_MODEL:-qwen2.5-coder:7b}
+      - SHANNON_VALIDATOR_MODEL=${SHANNON_VALIDATOR_MODEL:-qwen2.5-coder:7b}
+      - SHANNON_ORACLE_ENABLED=${SHANNON_ORACLE_ENABLED:-true}
+      - SHANNON_ORACLE_PROVIDER=${SHANNON_ORACLE_PROVIDER:-openai}
+      - SHANNON_ORACLE_MODEL=${SHANNON_ORACLE_MODEL:-gpt-5.4}
+      - SHANNON_ORACLE_REASONING=${SHANNON_ORACLE_REASONING:-medium}
+      - SHANNON_ORACLE_BASE_URL=${SHANNON_ORACLE_BASE_URL:-}
+      - SHANNON_ORACLE_API_KEY=${SHANNON_ORACLE_API_KEY:-}
+      - SHANNON_ANTHROPIC_PROMPT_CACHING=${SHANNON_ANTHROPIC_PROMPT_CACHING:-true}
+      - SHANNON_ANTHROPIC_CACHE_TTL=${SHANNON_ANTHROPIC_CACHE_TTL:-5m}
+      - SHANNON_ORACLE_MAX_TURNS=${SHANNON_ORACLE_MAX_TURNS:-6}
+      - SHANNON_ORACLE_MAX_TOOL_CALLS=${SHANNON_ORACLE_MAX_TOOL_CALLS:-12}
+      - SHANNON_ORACLE_MAX_RETRIES=${SHANNON_ORACLE_MAX_RETRIES:-2}
+      - SHANNON_PROMPT_DIR=${SHANNON_PROMPT_DIR:-/app/prompts}
+      - SHANNON_AGENT_COMPACTION_THRESHOLD=${SHANNON_AGENT_COMPACTION_THRESHOLD:-6}
+      - SHANNON_AGENT_COMPACTION_KEEP_RECENT=${SHANNON_AGENT_COMPACTION_KEEP_RECENT:-2}
+      - SHANNON_LOCAL_HYPOTHESIS_ENABLED=${SHANNON_LOCAL_HYPOTHESIS_ENABLED:-true}
+      - SHANNON_LOCAL_HYPOTHESIS_MAX_FINDINGS=${SHANNON_LOCAL_HYPOTHESIS_MAX_FINDINGS:-8}
+      - SHANNON_LOCAL_HYPOTHESIS_MAX_CHECKS=${SHANNON_LOCAL_HYPOTHESIS_MAX_CHECKS:-6}
+      - SHANNON_BROWSER_HEADLESS=${SHANNON_BROWSER_HEADLESS:-true}
+      - SHANNON_BROWSER_DEVTOOLS=${SHANNON_BROWSER_DEVTOOLS:-false}
+      - SHANNON_BROWSER_SLOW_MO_MS=${SHANNON_BROWSER_SLOW_MO_MS:-0}
+      - SHANNON_BROWSER_EXECUTOR_MODE=${SHANNON_BROWSER_EXECUTOR_MODE:-mediated}
       - SHANNON_MAX_TOKENS=${SHANNON_MAX_TOKENS:-8096}
       - SHANNON_TEMPERATURE=${SHANNON_TEMPERATURE:-0.1}
+      - SHANNON_PLANNER_TEMPERATURE=${SHANNON_PLANNER_TEMPERATURE:-0.0}
+      - SHANNON_EXECUTOR_TEMPERATURE=${SHANNON_EXECUTOR_TEMPERATURE:-0.1}
+      - SHANNON_VALIDATOR_TEMPERATURE=${SHANNON_VALIDATOR_TEMPERATURE:-0.0}
+      - HEXSTRIKE_BASE_URL=http://hexstrike:8888
+      - HEXSTRIKE_ENABLED=${HEXSTRIKE_ENABLED:-true}
+      - HEXSTRIKE_MAX_TOOL_TURNS=${HEXSTRIKE_MAX_TOOL_TURNS:-3}
+      - NVIDIA_API_KEY=${NVIDIA_API_KEY:-}
     ports:
-      - "8080:8080"
+      - "${SHANNON_HOST_PORT:-18080}:8080"
+    depends_on:
+      - hexstrike
     restart: unless-stopped
 
   sec-llm:
@@ -171,8 +210,23 @@ services:
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
       - FIRECRAWL_API_KEY=${FIRECRAWL_API_KEY:-}
       - SERPAPI_API_KEY=${SERPAPI_API_KEY:-}
+      - LLM_API_BASE=${LLM_API_BASE:-http://ollama:11434/v1}
+      - LLM_API_KEY=${LLM_API_KEY:-dummy}
+      - LLM_MODEL=${LLM_MODEL:-qwen2.5:7b}
     ports:
       - "8888:8888"
+    restart: unless-stopped
+
+  zap:
+    image: zaproxy/zap-stable
+    container_name: zap
+    command: >
+      zap.sh -daemon -port 8090 -host 0.0.0.0
+      -config api.addrs.addr.name=.*
+      -config api.addrs.addr.regex=true
+      -config api.key=${ZAP_API_KEY:-chimera-zap-key}
+    ports:
+      - "8090:8090"
     restart: unless-stopped
 
   juice-shop:
@@ -189,18 +243,22 @@ services:
     profiles: ["lab"]
     ports:
       - "2222:22"
-      - "8080:80"
+      - "8081:80"
       - "8443:443"
     restart: unless-stopped
 
   ollama:
     image: ollama/ollama:latest
     container_name: ollama-gpu
-    profiles: ["ollama"]
     ports:
       - "11434:11434"
     volumes:
       - ollama-models:/root/.ollama
+    environment:
+      - OLLAMA_KEEP_ALIVE=300s
+      - OLLAMA_MAX_LOADED_MODELS=1
+      - OLLAMA_NUM_PARALLEL=1
+      - OLLAMA_NUM_CTX=24576
     deploy:
       resources:
         reservations:

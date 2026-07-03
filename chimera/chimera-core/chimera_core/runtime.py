@@ -2,13 +2,30 @@ from __future__ import annotations
 
 import ipaddress
 import os
+import re
 import socket
 import subprocess
 import threading
 import time
 from typing import Iterable, List, Optional, Set, Dict, Any
 from pathlib import Path
+from uuid import uuid4
 import requests
+
+
+_ANSI_ESCAPE = re.compile(r"\x1b\[[0-9;]*[mGKHFJ]|\x1b\][^\x07]*\x07|\x1b[()][AB012]")
+_BOX_CHARS = re.compile(r"[─│┼┌┐└┘├┤┬┴╔╗╚╝╠╣╦╩╬═║▓░▒█▀▄■□●○◆◇→←↑↓]")
+
+
+def _clean_output_lines(text: str, max_lines: int = 30) -> List[str]:
+    """Strip ANSI codes and box-drawing characters; return last max_lines non-empty lines."""
+    lines = []
+    for raw in text.splitlines():
+        clean = _ANSI_ESCAPE.sub("", raw)
+        clean = _BOX_CHARS.sub("", clean).strip()
+        if clean:
+            lines.append(clean)
+    return lines[-max_lines:]
 
 from chimera_core.scope import ScopeGraph, ScopePolicy
 from chimera_core.ratelimit import RateLimiter
@@ -17,6 +34,7 @@ from chimera_core.logging import log_event, setup_logging
 from chimera_core.modules.safety.policy import SafetyPolicy
 from chimera_core.modules.safety.enforcer import SafetyEnforcer
 from chimera_core.modules.runtime.tool_profile import ToolProfile
+from chimera_core.target_extraction import extract_targets_from_command
 
 class RuntimeCancelledError(RuntimeError):
     pass
@@ -50,7 +68,7 @@ class Runtime:
         self.event_store = event_store
         self.artifacts_root = artifacts_root
         self.run_id = run_id
-        self.allowed_binaries: Set[str] = {name.lower() for name in (allowed_binaries or {"python", "python3", "autoswagger", "strix", "curl"})}
+        self.allowed_binaries: Set[str] = {name.lower() for name in (allowed_binaries or {"python", "python3", "autoswagger", "strix", "zap", "curl"})}
         self.max_output_bytes = max_output_bytes
         self.max_artifacts_bytes = 1_000_000
         self.artifacts_bytes_written = 0
@@ -66,40 +84,30 @@ class Runtime:
         effective_rps = min(scope_policy.max_rps, self.safety_policy.rps)
         self.rate_limiter = RateLimiter(effective_rps)
 
+    def _emit_event(self, event_type: str, payload: Dict[str, Any], *, source: str = "runtime") -> Dict[str, Any]:
+        payload = dict(payload)
+        payload.setdefault("run_id", self.run_id)
+        return self.event_store.emit({
+            "event_id": str(uuid4()),
+            "run_id": self.run_id,
+            "event_type": event_type,
+            "source": source,
+            "payload": payload,
+        })
+
+    def _emit_artifact_saved(self, *, task_id: Optional[str], path: Path, artifact_type: str, stream: Optional[str] = None, source: str = "runtime") -> None:
+        payload: Dict[str, Any] = {
+            "run_id": self.run_id,
+            "task_id": task_id,
+            "path": str(path),
+            "artifact_type": artifact_type,
+        }
+        if stream:
+            payload["stream"] = stream
+        self._emit_event("artifact_saved", payload, source=source)
+
     def _extract_targets(self, command: List[str]) -> List[str]:
-        """A simple heuristic to find a URL or domain in a command list."""
-        targets: List[str] = []
-        for index, arg in enumerate(command):
-            if index == 0:
-                continue
-            # Skip command flags/options
-            if arg.startswith("-"):
-                continue
-            # URLs are definitely targets
-            if arg.startswith("http://") or arg.startswith("https://"):
-                targets.append(arg)
-                continue
-            # Skip file paths
-            if "/" in arg or "\\" in arg:
-                continue
-            # Skip Python module names (e.g., strix.interface.main)
-            # These don't have TLDs and usually have multiple segments
-            if "." in arg:
-                # Check if it looks like a domain (has common TLD) vs module name
-                parts = arg.split(".")
-                # Common TLDs - if last part is one of these, likely a domain
-                tlds = {"com", "org", "net", "edu", "gov", "io", "co", "us", "uk", "dev", "app", "xyz", "me"}
-                if len(parts) >= 2 and parts[-1].lower() in tlds:
-                    targets.append(arg)
-                    continue
-                # Otherwise skip (likely a module name or version number)
-            # Check for IP addresses
-            try:
-                ipaddress.ip_address(arg)
-                targets.append(arg)
-            except ValueError:
-                continue
-        return targets
+        return extract_targets_from_command(command)
 
     def _is_private_ip(self, ip: ipaddress._BaseAddress) -> bool:
         return ip.is_private or ip.is_loopback or ip.is_link_local
@@ -235,21 +243,32 @@ class Runtime:
 
         self._validate_command(command)
 
-        self.event_store.emit({
-            "event_type": "cmd_started",
-            "payload": {
-                "run_id": self.run_id,
+        self._emit_event(
+            "cmd_started",
+            {
                 "task_id": task_id,
                 "command": command,
             },
-        })
+        )
         log_event(self.logger, "INFO", "cmd_started", run_id=self.run_id, task_id=task_id, command=command)
 
         # 1. Enforce Scope
         if self.safety_policy.enforce_scope:
             targets = self._extract_targets(command)
             for target in targets:
-                self._check_target_scope(target)
+                try:
+                    self._check_target_scope(target)
+                except ValueError as exc:
+                    self._emit_event(
+                        "scope_violation",
+                        {
+                            "task_id": task_id,
+                            "command": command,
+                            "rejected_targets": [target],
+                            "reason": str(exc),
+                        },
+                    )
+                    raise
 
         # 2. Enforce Rate Limiting
         if not self.rate_limiter.acquire():
@@ -266,28 +285,20 @@ class Runtime:
         stderr_bytes = stderr_text.encode("utf-8", errors="ignore")
         if len(stdout_bytes) > self.max_output_bytes:
             stdout_text = stdout_bytes[: self.max_output_bytes].decode("utf-8", errors="ignore")
-            self.event_store.emit({
-                "event_type": "output_truncated",
-                "payload": {
-                    "run_id": self.run_id,
-                    "task_id": task_id,
-                    "stream": "stdout",
-                    "original_bytes": len(stdout_bytes),
-                    "kept_bytes": len(stdout_text.encode("utf-8", errors="ignore")),
-                },
+            self._emit_event("output_truncated", {
+                "task_id": task_id,
+                "stream": "stdout",
+                "original_bytes": len(stdout_bytes),
+                "kept_bytes": len(stdout_text.encode("utf-8", errors="ignore")),
             })
             log_event(self.logger, "WARNING", "output_truncated", run_id=self.run_id, task_id=task_id, stream="stdout", original_bytes=len(stdout_bytes))
         if len(stderr_bytes) > self.max_output_bytes:
             stderr_text = stderr_bytes[: self.max_output_bytes].decode("utf-8", errors="ignore")
-            self.event_store.emit({
-                "event_type": "output_truncated",
-                "payload": {
-                    "run_id": self.run_id,
-                    "task_id": task_id,
-                    "stream": "stderr",
-                    "original_bytes": len(stderr_bytes),
-                    "kept_bytes": len(stderr_text.encode("utf-8", errors="ignore")),
-                },
+            self._emit_event("output_truncated", {
+                "task_id": task_id,
+                "stream": "stderr",
+                "original_bytes": len(stderr_bytes),
+                "kept_bytes": len(stderr_text.encode("utf-8", errors="ignore")),
             })
             log_event(self.logger, "WARNING", "output_truncated", run_id=self.run_id, task_id=task_id, stream="stderr", original_bytes=len(stderr_bytes))
 
@@ -295,13 +306,9 @@ class Runtime:
         projected = self.artifacts_bytes_written + total_bytes
         if projected > self.max_artifacts_bytes:
             if not self._cap_warned:
-                self.event_store.emit({
-                    "event_type": "run_limit_warning",
-                    "payload": {
-                        "run_id": self.run_id,
-                        "task_id": task_id,
-                        "limit_bytes": self.max_artifacts_bytes,
-                    },
+                self._emit_event("run_limit_warning", {
+                    "task_id": task_id,
+                    "limit_bytes": self.max_artifacts_bytes,
                 })
                 log_event(self.logger, "WARNING", "run_limit_warning", run_id=self.run_id, task_id=task_id, limit_bytes=self.max_artifacts_bytes)
                 self._cap_warned = True
@@ -318,35 +325,26 @@ class Runtime:
         stdout_path.write_text(stdout_text, encoding="utf-8")
         stderr_path.write_text(stderr_text, encoding="utf-8")
 
-        self.event_store.emit({
-            "event_type": "artifact_saved",
-            "payload": {
-                "run_id": self.run_id,
-                "task_id": task_id,
-                "path": str(stdout_path),
-                "stream": "stdout",
-            },
-        })
+        self._emit_artifact_saved(task_id=task_id, path=stdout_path, artifact_type="stdout", stream="stdout")
         log_event(self.logger, "INFO", "artifact_saved", run_id=self.run_id, task_id=task_id, path=str(stdout_path), stream="stdout")
-        self.event_store.emit({
-            "event_type": "artifact_saved",
-            "payload": {
-                "run_id": self.run_id,
-                "task_id": task_id,
-                "path": str(stderr_path),
-                "stream": "stderr",
-            },
-        })
+        self._emit_artifact_saved(task_id=task_id, path=stderr_path, artifact_type="stderr", stream="stderr")
         log_event(self.logger, "INFO", "artifact_saved", run_id=self.run_id, task_id=task_id, path=str(stderr_path), stream="stderr")
-        self.event_store.emit({
-            "event_type": "cmd_finished",
-            "payload": {
-                "run_id": self.run_id,
-                "task_id": task_id,
-                "returncode": result.returncode,
-            },
+        self._emit_event("cmd_finished", {
+            "task_id": task_id,
+            "returncode": result.returncode,
+            "artifact_paths": [str(stdout_path), str(stderr_path)],
         })
         log_event(self.logger, "INFO", "cmd_finished", run_id=self.run_id, task_id=task_id, returncode=result.returncode)
+
+        # Stream cleaned stdout lines so the TUI can display tool output in real time.
+        output_for_stream = stdout_text if stdout_text.strip() else stderr_text
+        clean_lines = _clean_output_lines(output_for_stream)
+        if clean_lines:
+            self._emit_event("stdout_chunk", {
+                "task_id": task_id,
+                "command": command[0] if command else "cmd",
+                "lines": clean_lines,
+            })
 
         return result
 

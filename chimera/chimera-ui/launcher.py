@@ -1133,6 +1133,7 @@ class ChimeraLauncher:
 
         run_info = getattr(self, "current_run_info", {}) or {}
         options = run_info.get("options", {})
+        stats = run_info.get("stats", {}) or {}
         scope_info = run_info.get("scope_normalized") or run_info.get("scope") or {}
         allowlist = scope_info.get("allowlist", [])
 
@@ -1154,7 +1155,11 @@ class ChimeraLauncher:
             banner.pack(anchor=tk.W, pady=(8, 0))
         summary = ttk.Label(
             self.content_frame,
-            text=f"Targets: {targets}",
+            text=(
+                f"Targets: {targets} | Findings: {stats.get('findings_total', 0)} | "
+                f"Verified probes: {stats.get('verification_passed', 0)} | "
+                f"Cache skips: {stats.get('verification_skipped_cache_hits', 0)}"
+            ),
             style="Matrix.TLabel",
         )
         summary.pack(anchor=tk.W, pady=(4, 8))

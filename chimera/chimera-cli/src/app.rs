@@ -4,6 +4,7 @@ use crate::models::{FindingSummary, RunDetail, RunSummary, StatusResponse};
 use crate::render::{render_status_block, stat_u64};
 use crate::theme::ThemeName;
 use anyhow::Result;
+use serde_json::Value;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
@@ -166,6 +167,8 @@ pub struct App {
     pub workflow: WorkflowProfile,
     pub pipeline: String,
     pub program: Option<String>,
+    pub ollama_base: String,
+    pub ollama_model: String,
     pub status: AppStatus,
     pub output_lines: Vec<String>,
     pub command_history: Vec<String>,
@@ -185,6 +188,8 @@ impl App {
         target: Option<String>,
         pipeline: String,
         program: Option<String>,
+        ollama_base: String,
+        ollama_model: Option<String>,
     ) -> Self {
         let mut app = Self {
             running: true,
@@ -199,6 +204,8 @@ impl App {
             workflow: WorkflowProfile::Standard,
             pipeline,
             program,
+            ollama_base,
+            ollama_model: ollama_model.unwrap_or_else(|| "whiterabbitneo-13b".to_string()),
             status: AppStatus {
                 text: "Ready".to_string(),
                 error: false,
@@ -216,6 +223,7 @@ impl App {
         };
         app.push_output("CHIMERA operator console ready.");
         app.push_output("Primary actions: Set Target, Run Workflow, Ask AI.");
+        app.push_output("Direct model chat: use :models, :set ollama model <name>, :chat <prompt>.");
         app.push_output("Press ? for help, : for exact commands, / for model-backed actions.");
         app
     }
@@ -228,6 +236,8 @@ impl App {
                 Ok(vec![Effect::RefreshSnapshot])
             }
             Action::SnapshotLoaded(snapshot) => {
+                let previous_snapshot = self.snapshot.clone();
+                let previous_selected_run_id = self.selected_run_id.clone();
                 self.snapshot = snapshot;
                 if let Some(run_id) = self.snapshot.selected_run_id.clone() {
                     self.selected_run_id = Some(run_id.clone());
@@ -242,6 +252,11 @@ impl App {
                 } else if !self.snapshot.runs.is_empty() {
                     self.highlighted_run = self.highlighted_run.min(self.snapshot.runs.len() - 1);
                 }
+
+                self.append_live_snapshot_changes(
+                    &previous_snapshot,
+                    previous_selected_run_id.as_deref(),
+                );
 
                 if let Some(err) = self.snapshot.api_error.clone() {
                     self.set_status(format!("API degraded: {}", err), true);
@@ -481,6 +496,12 @@ impl App {
                 self.set_status("Telemetry written to output", false);
                 Ok(Vec::new())
             }
+            Action::ShowModels => {
+                self.focus = FocusedPane::Output;
+                self.push_output("Listing installed Ollama models…");
+                self.set_status("Querying Ollama /api/tags", false);
+                Ok(vec![Effect::FetchOllamaModels])
+            }
             Action::LaunchScan => {
                 if self.target.is_none() && self.staged_scope_text.is_none() {
                     self.set_status("No target or scope is staged", true);
@@ -499,6 +520,18 @@ impl App {
                 self.push_output(format!("Oracle request: {}", question));
                 self.set_status("Querying model-backed action service", false);
                 Ok(vec![Effect::FetchOracle(question)])
+            }
+            Action::AskOllama(prompt) => {
+                self.focus = FocusedPane::Output;
+                self.push_output(format!("Ollama prompt: {}", prompt));
+                self.set_status(format!("Querying Ollama ({})", self.ollama_model), false);
+                Ok(vec![Effect::FetchOllamaChat(prompt)])
+            }
+            Action::SetOllamaModel(model) => {
+                self.ollama_model = model.clone();
+                self.push_output(format!("Direct Ollama model set to {}", model));
+                self.set_status(format!("Ollama model: {}", model), false);
+                Ok(Vec::new())
             }
             Action::AddOutputs(lines) => {
                 for line in lines {
@@ -561,7 +594,7 @@ impl App {
         match self.mode {
             Mode::Command => match self.input_context {
                 InputContext::CommandPalette => {
-                    "Examples: set target 10.0.0.8 | scan quick | theme red"
+                    "Examples: models | chat hello | set ollama model whiterabbitneo-13b"
                 }
                 InputContext::SetTarget => {
                     "Examples: 10.0.0.8 | example.com | https://target.local"
@@ -598,12 +631,72 @@ impl App {
     }
 
     pub fn context_lines(&self) -> Vec<String> {
+        if self.run_is_active() {
+            let findings = self.snapshot.findings.len();
+            let chains = self
+                .snapshot
+                .selected_run
+                .as_ref()
+                .map(|run| stat_u64(&run.stats, "exploit_chains"))
+                .unwrap_or(0);
+            let phase = self
+                .snapshot
+                .selected_run
+                .as_ref()
+                .and_then(|run| run.status.clone())
+                .or_else(|| {
+                    self.snapshot
+                        .status
+                        .active_run
+                        .as_ref()
+                        .and_then(|run| run.phase.clone())
+                })
+                .unwrap_or_else(|| "running".to_string());
+            let latest_task = self
+                .latest_task_summary()
+                .unwrap_or_else(|| "waiting for task telemetry".to_string());
+            let latest_action = self
+                .latest_action_summary()
+                .unwrap_or_else(|| "no recent operator events".to_string());
+            let latest_finding = self
+                .snapshot
+                .findings
+                .first()
+                .map(|finding| format!("[{}] {}", severity_badge(&finding.severity), finding.title))
+                .unwrap_or_else(|| "none yet".to_string());
+
+            return vec![
+                format!("Target: {}", self.target.as_deref().unwrap_or("not set")),
+                format!("Workflow: {}", self.workflow.label()),
+                format!("Pipeline: {}", self.pipeline),
+                format!("Program: {}", self.program.as_deref().unwrap_or("unset")),
+                String::new(),
+                format!(
+                    "Active Run: {}",
+                    self.selected_run_id.as_deref().unwrap_or("none")
+                ),
+                format!("Phase: {}", phase),
+                format!("Findings: {} | Chains: {}", findings, chains),
+                String::new(),
+                "Latest Task".to_string(),
+                latest_task,
+                String::new(),
+                "Latest Action".to_string(),
+                latest_action,
+                String::new(),
+                "Latest Finding".to_string(),
+                latest_finding,
+            ];
+        }
+
         let mut lines = vec![
             format!("Target: {}", self.target.as_deref().unwrap_or("not set")),
             format!("Workflow: {}", self.workflow.label()),
             format!("Pipeline: {}", self.pipeline),
             format!("Program: {}", self.program.as_deref().unwrap_or("unset")),
-            format!("Model: {}", self.connection_label()),
+            format!("Connection: {}", self.connection_label()),
+            format!("Ollama: {}", self.ollama_base),
+            format!("Ollama Model: {}", self.ollama_model),
             format!(
                 "Selected Run: {}",
                 self.selected_run_id.as_deref().unwrap_or("none")
@@ -648,6 +741,18 @@ impl App {
         } else {
             "Connected"
         }
+    }
+
+    pub fn run_is_active(&self) -> bool {
+        if let Some(status) = self
+            .snapshot
+            .selected_run
+            .as_ref()
+            .and_then(|run| run.status.as_deref())
+        {
+            return !matches!(status, "completed" | "failed" | "cancelled");
+        }
+        self.snapshot.status.active_run.is_some()
     }
 
     pub fn append_findings_preview(&mut self, run_id: &str, findings: &[FindingSummary]) {
@@ -852,6 +957,74 @@ impl App {
         self.output_scroll = self.output_lines.len().saturating_sub(1);
     }
 
+    fn append_live_snapshot_changes(
+        &mut self,
+        previous_snapshot: &ConsoleSnapshot,
+        previous_selected_run_id: Option<&str>,
+    ) {
+        let current_run_id = self.snapshot.selected_run_id.as_deref();
+        let new_events = if current_run_id != previous_selected_run_id {
+            if self.run_is_active() {
+                self.snapshot
+                    .events
+                    .iter()
+                    .rev()
+                    .filter(|event| is_operator_relevant_event(event))
+                    .take(6)
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .rev()
+                    .collect::<Vec<_>>()
+            } else {
+                Vec::new()
+            }
+        } else {
+            diff_events(&previous_snapshot.events, &self.snapshot.events)
+                .into_iter()
+                .filter(|event| is_operator_relevant_event(event))
+                .collect::<Vec<_>>()
+        };
+
+        for event in new_events {
+            for line in expand_event_lines(&event) {
+                self.push_output(line);
+            }
+        }
+    }
+
+    fn latest_task_summary(&self) -> Option<String> {
+        self.snapshot.events.iter().rev().find_map(|raw| {
+            let val: Value = serde_json::from_str(raw).ok()?;
+            let event_type = val["event_type"].as_str()?;
+            let payload = &val["payload"];
+            match event_type {
+                "task_executing" => {
+                    let adapter = payload["adapter"].as_str().unwrap_or("?");
+                    let target = payload["target"].as_str().unwrap_or("");
+                    Some(format!("{adapter} -> {target}"))
+                }
+                "task_started" | "task_finished" => payload["tool"]
+                    .as_str()
+                    .or(payload["adapter"].as_str())
+                    .map(|tool| tool.to_string()),
+                "task_failed" => payload["adapter"]
+                    .as_str()
+                    .map(|adapter| format!("{adapter} failed")),
+                _ => None,
+            }
+        })
+    }
+
+    fn latest_action_summary(&self) -> Option<String> {
+        self.snapshot
+            .events
+            .iter()
+            .rev()
+            .find(|raw| is_operator_relevant_event(raw))
+            .map(|raw| format_event_for_output(raw))
+    }
+
     pub fn help_lines(&self) -> Vec<String> {
         let mut lines = vec![
             "Modes".to_string(),
@@ -877,4 +1050,223 @@ fn wrapped_index(current: usize, len: usize, delta: isize) -> usize {
     } else {
         (current + delta as usize) % len
     }
+}
+
+fn severity_badge(severity: &str) -> &'static str {
+    match severity.to_ascii_lowercase().as_str() {
+        "critical" => "CRIT",
+        "high" => "HIGH",
+        "medium" => "MED",
+        "low" => "LOW",
+        _ => "INFO",
+    }
+}
+
+fn diff_events(previous: &[String], current: &[String]) -> Vec<String> {
+    if previous.is_empty() {
+        return current.to_vec();
+    }
+    if current.starts_with(previous) {
+        return current[previous.len()..].to_vec();
+    }
+    if let Some(last_seen) = previous.last() {
+        if let Some(index) = current.iter().rposition(|item| item == last_seen) {
+            return current[index + 1..].to_vec();
+        }
+    }
+    current
+        .iter()
+        .rev()
+        .take(4)
+        .cloned()
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect()
+}
+
+fn is_operator_relevant_event(raw: &str) -> bool {
+    let Ok(val) = serde_json::from_str::<Value>(raw) else {
+        return true;
+    };
+    matches!(
+        val["event_type"].as_str().unwrap_or_default(),
+        "task_started"
+            | "task_executing"
+            | "cmd_started"
+            | "cmd_finished"
+            | "stdout_chunk"
+            | "task_failed"
+            | "task_finished"
+            | "artifact_saved"
+            | "sink_error"
+            | "execution_phase_started"
+            | "execution_phase_completed"
+            | "run_failed"
+            | "run_completed"
+            | "shannon_oracle"
+            | "ai_query_sent"
+            | "ai_analysis"
+    )
+}
+
+/// Like `format_event_for_output` but may expand a single event into multiple lines
+/// (e.g. `stdout_chunk` carries an array of output lines).
+fn expand_event_lines(raw: &str) -> Vec<String> {
+    let Ok(val) = serde_json::from_str::<Value>(raw) else {
+        return vec![raw.to_string()];
+    };
+    let event_type = val["event_type"].as_str().unwrap_or("event");
+    let payload = &val["payload"];
+
+    match event_type {
+        "stdout_chunk" => {
+            let cmd = payload["command"].as_str().unwrap_or("cmd");
+            payload["lines"]
+                .as_array()
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str())
+                        .map(|line| format!("[tool] {cmd}: {line}"))
+                        .collect()
+                })
+                .unwrap_or_default()
+        }
+        "ai_query_sent" => {
+            let excerpt = payload["query_excerpt"].as_str().unwrap_or("…");
+            let short = truncate(excerpt, 120);
+            vec![format!("[ai] Sending to AI: {short}")]
+        }
+        "ai_analysis" => {
+            let count = payload["findings_count"].as_u64().unwrap_or(0);
+            let titles = payload["finding_titles"]
+                .as_array()
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                })
+                .unwrap_or_default();
+            let line = if count == 0 {
+                "[ai] AI analysis complete — no findings".to_string()
+            } else if titles.is_empty() {
+                format!("[ai] AI found {count} finding(s)")
+            } else {
+                format!("[ai] AI found {count}: {titles}")
+            };
+            vec![line]
+        }
+        _ => vec![format_event_for_output(raw)],
+    }
+}
+
+fn format_event_for_output(raw: &str) -> String {
+    let Ok(val) = serde_json::from_str::<Value>(raw) else {
+        return raw.to_string();
+    };
+    let event_type = val["event_type"].as_str().unwrap_or("event");
+    let payload = &val["payload"];
+
+    match event_type {
+        "task_started" => {
+            let tool = payload["tool"].as_str().unwrap_or("?");
+            let task_id = payload["task_id"].as_str().unwrap_or("task");
+            format!("[*] {tool} started ({task_id})")
+        }
+        "task_executing" => {
+            let adapter = payload["adapter"].as_str().unwrap_or("?");
+            let target = payload["target"].as_str().unwrap_or("");
+            format!("[*] {adapter} -> {target}")
+        }
+        "cmd_started" => {
+            let command = payload["command"]
+                .as_array()
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|item| item.as_str())
+                        .take(12)
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                })
+                .unwrap_or_else(|| "?".to_string());
+            format!("[cmd] {command}")
+        }
+        "cmd_finished" => {
+            let returncode = payload["returncode"].as_i64().unwrap_or_default();
+            if returncode == 0 {
+                format!("[+] command completed (rc={returncode})")
+            } else {
+                format!("[!] command exited non-zero (rc={returncode})")
+            }
+        }
+        "task_failed" => {
+            let adapter = payload["adapter"].as_str().unwrap_or("?");
+            let err = payload["error"].as_str().unwrap_or("unknown error");
+            let short = err.lines().next().unwrap_or(err);
+            format!("[x] {adapter} failed: {}", truncate(short, 96))
+        }
+        "task_finished" => {
+            let tool = payload["tool"]
+                .as_str()
+                .or(payload["adapter"].as_str())
+                .unwrap_or("?");
+            format!("[+] {tool} completed")
+        }
+        "artifact_saved" => {
+            if let Some(stream) = payload["stream"].as_str() {
+                let path = payload["path"].as_str().map(short_path).unwrap_or_default();
+                format!("[artifact] {stream} captured -> {path}")
+            } else {
+                let artifact_type = payload["artifact_type"]
+                    .as_str()
+                    .or(payload["tool"].as_str())
+                    .unwrap_or("artifact");
+                let path = payload["path"].as_str().map(short_path).unwrap_or_default();
+                format!("[artifact] {artifact_type} saved -> {path}")
+            }
+        }
+        "sink_error" => {
+            let message = payload["message"].as_str().unwrap_or("unknown sink error");
+            format!("[!] sink error: {}", truncate(message, 96))
+        }
+        "execution_phase_started" => {
+            let message = payload["message"].as_str().unwrap_or("execution started");
+            format!("[*] {message}")
+        }
+        "execution_phase_completed" | "run_completed" => "[+] run complete".to_string(),
+        "run_failed" => {
+            let tasks = payload["failed_tasks"]
+                .as_array()
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|item| item.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                })
+                .unwrap_or_default();
+            format!("[x] run failed: {tasks}")
+        }
+        "shannon_oracle" => "[ai] shannon oracle response received".to_string(),
+        other if other.contains("oracle") || other.contains("agent") => {
+            format!("[ai] {other}")
+        }
+        _ => format!("[*] {event_type}"),
+    }
+}
+
+fn short_path(path: &str) -> String {
+    let parts = path
+        .split('/')
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>();
+    let keep = parts.len().min(3);
+    parts[parts.len().saturating_sub(keep)..].join("/")
+}
+
+fn truncate(value: &str, width: usize) -> String {
+    if value.len() <= width {
+        return value.to_string();
+    }
+    format!("{}...", &value[..width.saturating_sub(3)])
 }

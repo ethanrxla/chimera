@@ -64,6 +64,73 @@ CHAIN_RULES: List[ChainRule] = [
         narrative="Authentication exposure paired with missing throttling materially increases exploitability.",
         confidence_floor=0.8,
     ),
+    ChainRule(
+        rule_id="claims_injection_privilege_escalation",
+        title="Claims injection on self-profile enables privilege escalation via identity provider",
+        required_types=("CLAIMS_INJECTION", "AUTH_EXPOSURE"),
+        impact="PrivilegeEscalation",
+        combined_severity="critical",
+        narrative=(
+            "A user with write access to their own identity profile can inject privilege-bearing "
+            "claims into the stored Identities array. If those claims are evaluated during "
+            "token minting or session establishment, the injected role claim produces an "
+            "authenticated session with administrator-level privileges. Confirmed on Octopus Deploy: "
+            "PUT /api/users/{self} accepts and persists arbitrary Identities claims including "
+            "role=administrator and cross-provider identity assertions."
+        ),
+        confidence_floor=0.85,
+        require_confirmed=True,
+    ),
+    ChainRule(
+        rule_id="conditional_authz_to_idor_write",
+        title="Data-dependent authorization bypass enables cross-user write via IDOR",
+        required_types=("CONDITIONAL_AUTHZ", "IDOR"),
+        impact="UnauthorizedDataModification",
+        combined_severity="high",
+        narrative=(
+            "Authorization checks that fire only when data exists (200+empty when target has "
+            "no resources, 403 when target has resources) create a conditional bypass window. "
+            "If the write path (POST) on the same endpoint follows the same conditional pattern, "
+            "an attacker can create resources on behalf of another user — including API keys — "
+            "during the window when no resources exist."
+        ),
+        confidence_floor=0.78,
+        require_confirmed=False,
+    ),
+    ChainRule(
+        rule_id="enumeration_to_conditional_auth_targeted_attack",
+        title="User enumeration combined with data-dependent auth bypass enables targeted attack",
+        required_types=("AUTH_EXPOSURE", "CONDITIONAL_AUTHZ"),
+        impact="CredentialEnumeration",
+        combined_severity="high",
+        narrative=(
+            "User existence enumeration via 403/404 differential on /api/users/{id} combined "
+            "with conditional authorization bypass on /api/users/{id}/apikeys creates a "
+            "two-oracle system. An attacker identifies all existing user IDs then probes each "
+            "for API key absence (200+empty = no keys, 403 = keys exist). Users in the keyless "
+            "state are targets for credential stuffing or conditional IDOR write."
+        ),
+        confidence_floor=0.80,
+        require_confirmed=False,
+    ),
+    ChainRule(
+        rule_id="missing_authz_write_plus_auth_exposure",
+        title="Missing authorization on write endpoints enables deployment pipeline manipulation via exposed internals",
+        required_types=("MISSING_AUTHZ", "AUTH_EXPOSURE"),
+        impact="UnauthorizedDeploymentPipelineManipulation",
+        combined_severity="high",
+        narrative=(
+            "Write endpoints that bypass authorization checks (CWE-862) combined with disclosure "
+            "of server internals (feature toggles, server config, pipeline state) create an "
+            "attack surface where a low-privileged user can modify server-level configuration "
+            "and behavior. Confirmed on Octopus Deploy: POST /api/configuration/versioncontrol/clear-cache "
+            "and PUT /api/dynamic-extensions/features/values return 200 for any authenticated user "
+            "with no permission check, enabling cache poisoning, deployment race conditions, and "
+            "manipulation of external telemetry extension behavior."
+        ),
+        confidence_floor=0.82,
+        require_confirmed=True,
+    ),
 ]
 
 
@@ -121,7 +188,7 @@ def _match_rule(rule: ChainRule, findings: Iterable[Finding]) -> List[List[Findi
 def _eligible_for_rule(rule: ChainRule, finding: Finding) -> bool:
     if not rule.require_confirmed:
         return True
-    return finding.validation_status == "confirmed" or finding.finding_type in {"AUTH_EXPOSURE", "IDOR"}
+    return finding.validation_status == "confirmed" or finding.finding_type in {"AUTH_EXPOSURE", "IDOR", "CONDITIONAL_AUTHZ", "CLAIMS_INJECTION", "MISSING_AUTHZ"}
 
 
 def _combine_findings(groups: Sequence[List[Finding]], index: int, current: List[Finding], output: List[List[Finding]]) -> None:

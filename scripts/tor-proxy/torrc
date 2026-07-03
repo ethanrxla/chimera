@@ -1,0 +1,8 @@
+SocksPort 0.0.0.0:9050
+ClientOnly 1
+RunAsDaemon 0
+Log notice stdout
+
+# Keep this container as a client/proxy only. It will not act as a relay or exit node.
+ExitRelay 0
+ORPort 0

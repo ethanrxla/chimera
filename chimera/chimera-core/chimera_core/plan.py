@@ -33,7 +33,13 @@ class ExecutionPlan:
     def __init__(self):
         self.tasks: Dict[str, Task] = {}
         self.graph: Dict[str, List[str]] = {}
-        self.stages: List[str] = ["discover", "classify", "validate", "chain", "report"]
+        self.stages: List[str] = [
+            "pre_reconnaissance",
+            "reconnaissance",
+            "vulnerability_analysis",
+            "exploitation",
+            "reporting",
+        ]
         self.metadata: Dict[str, object] = {"asset_types": {}, "targets": {}}
 
     def add_task(self, task: Task) -> None:
@@ -66,3 +72,17 @@ class ExecutionPlan:
 
     def ready_tasks(self, indegree: Dict[str, int]) -> List[Task]:
         return [self.tasks[task_id] for task_id, degree in indegree.items() if degree == 0]
+
+    def validate_acyclic(self) -> None:
+        indegree = self.indegrees()
+        ready = [task_id for task_id, degree in indegree.items() if degree == 0]
+        seen = 0
+        while ready:
+            current = ready.pop()
+            seen += 1
+            for neighbor in self.graph.get(current, []):
+                indegree[neighbor] -= 1
+                if indegree[neighbor] == 0:
+                    ready.append(neighbor)
+        if seen != len(self.tasks):
+            raise ValueError("Execution plan contains a cycle")

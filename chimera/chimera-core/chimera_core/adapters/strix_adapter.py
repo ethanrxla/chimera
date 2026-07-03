@@ -1,6 +1,9 @@
 import csv
 import json
+import os
+import re
 import sys
+import time
 from pathlib import Path
 from urllib.parse import urlparse
 from typing import Dict, List, Optional
@@ -13,6 +16,10 @@ from chimera_core.tool_runner import ToolRunner
 
 def _command_return_code(result: object) -> int:
     return int(getattr(result, "returncode", getattr(result, "exit_code", 0)))
+
+
+def _normalize_instruction_text(instruction: str) -> str:
+    return re.sub(r"\s+", " ", instruction).strip()
 
 
 class StrixAdapter(AdapterBase):
@@ -50,17 +57,17 @@ class StrixAdapter(AdapterBase):
     def build_command(self, targets: List[str]) -> List[str]:
         self.validate_targets(targets)
 
-        command = self.tool_runner.base_command(self.id, [sys.executable, "-m", "strix.interface.main", "-n"])
+        strix_bin = os.environ.get("STRIX_BIN") or str(Path(sys.executable).parent / "strix")
+        command = self.tool_runner.base_command(self.id, [strix_bin, "-n"])
         mode = self.options.get("scan_mode", "standard")
         command.extend(["--scan-mode", str(mode)])
-
-        run_name = f"chimera-{self.run_id}-{self.task_id}"
-        command.extend(["--run-name", run_name])
 
         rate = self.rate_limits.get("requests_per_second", self.scope_policy.max_rps)
         instruction = self.options.get("instruction")
         if instruction:
-            instruction = f"{instruction}\n\nRespect rate limit: {rate} rps."
+            instruction = _normalize_instruction_text(
+                f"{instruction} Respect rate limit: {rate} rps."
+            )
         else:
             instruction = f"Respect rate limit: {rate} rps."
         command.extend(["--instruction", instruction])
@@ -116,6 +123,22 @@ class StrixAdapter(AdapterBase):
 
         return artifacts
 
+    def _existing_strix_run_dirs(self) -> set[Path]:
+        if not self.strix_runs_root.exists():
+            return set()
+        return {path for path in self.strix_runs_root.iterdir() if path.is_dir()}
+
+    def _resolve_run_dir(self, before_dirs: set[Path]) -> Optional[Path]:
+        after_dirs = self._existing_strix_run_dirs()
+        new_dirs = [path for path in after_dirs - before_dirs if path.is_dir()]
+        if len(new_dirs) == 1:
+            return new_dirs[0]
+        if new_dirs:
+            return max(new_dirs, key=lambda path: path.stat().st_mtime)
+        if after_dirs:
+            return max(after_dirs, key=lambda path: path.stat().st_mtime)
+        return None
+
     def _parse_strix_findings(self, run_name: str, targets: List[str]) -> List[Dict[str, object]]:
         report_dir = self.strix_runs_root / run_name
         csv_path = report_dir / "vulnerabilities.csv"
@@ -145,6 +168,8 @@ class StrixAdapter(AdapterBase):
                         "evidence_refs": evidence_refs,
                     }
                 )
+        entries = _deduplicate_findings(entries)
+        entries = _check_contradictions(entries, report_dir)
         return entries
 
     def _cleanup_sandbox_container(self, run_name: str) -> None:
@@ -161,31 +186,80 @@ class StrixAdapter(AdapterBase):
         live = bool(self.options.get("live", False))
         fixture_path = self.options.get("fixture_path")
         raw_output_override = self.options.get("raw_output_override")
+        prompt_artifact = self._save_prompt_artifact(targets)
 
         self.validate_targets(targets)
         self._emit_event("task_started", {"run_id": self.run_id, "task_id": self.task_id, "tool": self.id})
+        self._emit_event(
+            "llm_started",
+            {
+                "run_id": self.run_id,
+                "task_id": self.task_id,
+                "model": "strix",
+                "stage": "agentic_scan",
+                "prompt_artifact": prompt_artifact,
+                "response_artifact": None,
+                "usage": {},
+            },
+        )
 
         raw_output = None
         command = None
         if live:
+            before_dirs = self._existing_strix_run_dirs()
             command = self.build_command(targets)
             timeout = self.options.get("timeout_s")
-            run_name = f"chimera-{self.run_id}-{self.task_id}"
-            try:
-                result = self.tool_runner.run(
-                    self.id,
-                    command,
-                    task_id=self.task_id,
-                    timeout_s=timeout,
-                    cwd=self.strix_root,
-                )
-            finally:
-                self._cleanup_sandbox_container(run_name)
-            return_code = _command_return_code(result)
-            if return_code not in {0, 2}:
-                error_message = (result.stderr or result.stdout or f"{self.id} exited with code {return_code}").strip()
-                raise RuntimeError(error_message)
-            parsed = self._parse_strix_findings(run_name, targets)
+            max_attempts = 3
+            retry_delay_s = 8
+            last_error: Optional[str] = None
+            result = None
+            for attempt in range(1, max_attempts + 1):
+                try:
+                    result = self.tool_runner.run(
+                        self.id,
+                        command,
+                        task_id=self.task_id,
+                        timeout_s=timeout,
+                        cwd=self.strix_root,
+                    )
+                finally:
+                    resolved_run_dir = self._resolve_run_dir(before_dirs)
+                    if resolved_run_dir is not None:
+                        self._cleanup_sandbox_container(resolved_run_dir.name)
+                return_code = _command_return_code(result)
+                if return_code == 0:
+                    break
+                last_error = _pick_error_message(result.stdout, result.stderr, self.id, return_code)
+                if attempt < max_attempts and _is_transient_sandbox_error(last_error):
+                    self._emit_event(
+                        "task_retry",
+                        {
+                            "run_id": self.run_id,
+                            "task_id": self.task_id,
+                            "attempt": attempt,
+                            "reason": last_error[:200],
+                        },
+                    )
+                    time.sleep(retry_delay_s)
+                    before_dirs = self._existing_strix_run_dirs()
+                else:
+                    break
+            run_dir = self._resolve_run_dir(before_dirs)
+            if _command_return_code(result) != 0:
+                if run_dir is not None and _strix_run_completed(run_dir):
+                    self._emit_event("task_warning", {
+                        "run_id": self.run_id,
+                        "task_id": self.task_id,
+                        "message": (
+                            f"Strix exited {_command_return_code(result)} but produced a "
+                            f"completed run at {run_dir.name}; treating as partial_success"
+                        ),
+                        "return_code": _command_return_code(result),
+                        "outcome": "partial_success",
+                    })
+                else:
+                    raise RuntimeError(last_error)
+            parsed = self._parse_strix_findings(run_dir.name, targets) if run_dir is not None else []
             raw_output = json.dumps({"findings": parsed})
         else:
             self._emit_event("cmd_started", {"run_id": self.run_id, "task_id": self.task_id, "mode": "fixture"})
@@ -204,10 +278,24 @@ class StrixAdapter(AdapterBase):
                 "artifact_saved",
                 {"run_id": self.run_id, "task_id": self.task_id, "path": artifact_path, "tool": self.id},
             )
+        self._emit_event(
+            "llm_finished",
+            {
+                "run_id": self.run_id,
+                "task_id": self.task_id,
+                "model": "strix",
+                "stage": "agentic_scan",
+                "prompt_artifact": prompt_artifact,
+                "response_artifact": artifact_path,
+                "usage": {},
+            },
+        )
 
         findings = self.normalize(raw_output)
         if live:
-            artifacts.extend(self._collect_strix_reports(f"chimera-{self.run_id}-{self.task_id}"))
+            run_dir = self._resolve_run_dir(before_dirs)
+            if run_dir is not None:
+                artifacts.extend(self._collect_strix_reports(run_dir.name))
         findings_path = self._artifact_path("findings.json")
         if findings_path:
             findings_path.parent.mkdir(parents=True, exist_ok=True)
@@ -262,10 +350,170 @@ class StrixAdapter(AdapterBase):
                         "method": entry.get("method"),
                         "parameter": entry.get("parameter"),
                     },
-                    confidence=_confidence_from_severity(severity),
+                    confidence=float(entry.get("confidence_override") or _confidence_from_severity(severity)),
                 )
             )
         return findings
+
+    def _save_prompt_artifact(self, targets: List[str]) -> Optional[str]:
+        prompt_path = self._artifact_path("prompt.json")
+        if not prompt_path:
+            return None
+        prompt_path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "targets": targets,
+            "options": self.options,
+        }
+        prompt_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        self._emit_event(
+            "artifact_saved",
+            {"run_id": self.run_id, "task_id": self.task_id, "path": str(prompt_path), "tool": self.id},
+        )
+        return str(prompt_path)
+
+
+def _strix_run_completed(run_dir: Path) -> bool:
+    """Return True if the Strix run directory contains completion markers.
+
+    Checks (in order):
+    1. events.jsonl contains a ``run.completed`` event
+    2. vulnerabilities.csv exists with at least one data row (beyond the header)
+    """
+    events_path = run_dir / "events.jsonl"
+    if events_path.exists():
+        try:
+            for line in events_path.read_text(encoding="utf-8").splitlines():
+                if not line.strip():
+                    continue
+                e = json.loads(line)
+                if e.get("event_type") == "run.completed":
+                    return True
+        except Exception:
+            pass
+    csv_path = run_dir / "vulnerabilities.csv"
+    if csv_path.exists():
+        lines = [ln for ln in csv_path.read_text(encoding="utf-8").splitlines() if ln.strip()]
+        return len(lines) > 1
+    return False
+
+
+import re as _re
+
+_DEDUP_STOP = frozenset({
+    "in", "on", "the", "a", "an", "at", "of", "via", "for", "to", "by", "is", "are",
+})
+
+
+def _title_words(title: str) -> frozenset:
+    return frozenset(
+        w.lower() for w in _re.split(r"\W+", title)
+        if w and w.lower() not in _DEDUP_STOP
+    )
+
+
+def _deduplicate_findings(entries: List[Dict[str, object]]) -> List[Dict[str, object]]:
+    """Merge findings whose titles share >50% Jaccard word overlap at same severity+url."""
+    result: List[Dict[str, object]] = []
+    for entry in entries:
+        ew = _title_words(str(entry.get("title", "")))
+        merged = False
+        for existing in result:
+            xw = _title_words(str(existing.get("title", "")))
+            union = ew | xw
+            if (
+                existing.get("severity") == entry.get("severity")
+                and existing.get("url") == entry.get("url")
+                and union
+                and len(ew & xw) / len(union) > 0.5
+            ):
+                # Keep the entry with the richer description
+                if len(str(entry.get("description", ""))) > len(str(existing.get("description", ""))):
+                    existing.update({k: v for k, v in entry.items() if k != "evidence_refs"})
+                existing["evidence_refs"] = list(
+                    {*existing.get("evidence_refs", []), *entry.get("evidence_refs", [])}
+                )
+                merged = True
+                break
+        if not merged:
+            result.append(dict(entry))
+    return result
+
+
+_CONTRADICTION_PATTERNS: Dict[str, List[str]] = {
+    "clickjack": [
+        "robust against clickjacking",
+        "no clickjacking",
+        "protected against clickjacking",
+    ],
+    "xss": [
+        "no xss",
+        "protected against xss",
+        "no cross-site scripting",
+    ],
+    "csrf": ["no csrf", "protected against csrf"],
+    "injection": ["no sql injection", "no injection"],
+}
+
+
+def _check_contradictions(
+    entries: List[Dict[str, object]], report_dir: Path
+) -> List[Dict[str, object]]:
+    """Downgrade confidence when the Strix summary report contradicts a finding."""
+    report_path = report_dir / "penetration_test_report.md"
+    if not report_path.exists():
+        return entries
+    report_lower = report_path.read_text(encoding="utf-8").lower()
+    for entry in entries:
+        combined = f"{entry.get('title', '')} {entry.get('description', '')}".lower()
+        for vuln_key, phrases in _CONTRADICTION_PATTERNS.items():
+            if vuln_key in combined:
+                for phrase in phrases:
+                    if phrase in report_lower:
+                        entry["confidence_override"] = 0.3
+                        entry["contradiction_note"] = (
+                            f"Summary says '{phrase}' but finding exists; confidence downgraded"
+                        )
+                        break
+    return entries
+
+
+_TRANSIENT_SANDBOX_ERRORS = frozenset({
+    "container initialization timed out",
+    "tool server failed to start",
+    "please try again",
+})
+
+_FATAL_KEYWORDS = frozenset({"failed", "error", "timed out", "timeout", "exception", "traceback", "fatal"})
+
+
+def _is_transient_sandbox_error(message: str) -> bool:
+    """Return True if the error is a recoverable Docker sandbox startup failure."""
+    lower = message.lower()
+    return any(phrase in lower for phrase in _TRANSIENT_SANDBOX_ERRORS)
+
+
+def _pick_error_message(stdout: str, stderr: str, tool_id: str, return_code: int) -> str:
+    """Return the most informative error string from stdout/stderr on non-zero exit.
+
+    Strix emits Python DeprecationWarning / UserWarning noise to stderr even on
+    clean runs.  The actual fatal message (e.g. SandboxInitializationError) goes to
+    stdout.  Prefer stdout when it contains a fatal keyword; fall back to stderr if
+    stdout is empty or looks like pure noise; fall back to a generic code message last.
+    """
+    stdout = (stdout or "").strip()
+    stderr = (stderr or "").strip()
+
+    stdout_lower = stdout.lower()
+    if stdout and any(kw in stdout_lower for kw in _FATAL_KEYWORDS):
+        return stdout
+
+    if stderr:
+        return stderr
+
+    if stdout:
+        return stdout
+
+    return f"{tool_id} exited with code {return_code}"
 
 
 def _infer_finding_type(title: str, description: str) -> str:

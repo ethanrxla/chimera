@@ -8,12 +8,15 @@ const COMMAND_INDEX: &[&str] = &[
     "set workflow standard",
     "set pipeline task_runner",
     "set program HackerOne Demo",
+    "set ollama model whiterabbitneo-13b",
     "scan quick",
     "scan standard",
     "show status",
     "show runs",
     "show findings",
     "show logs",
+    "models",
+    "chat hello from whiterabbitneo",
     "theme red",
     "clear",
     "help",
@@ -35,6 +38,7 @@ pub fn parse_command(input: &str) -> Result<Vec<Action>> {
         "runs" | "show runs" => return Ok(vec![Action::ShowRuns]),
         "logs" | "show logs" => return Ok(vec![Action::ShowLogs]),
         "findings" | "show findings" => return Ok(vec![Action::ShowFindings(None)]),
+        "models" | "show models" | "ollama models" => return Ok(vec![Action::ShowModels]),
         "clear" => return Ok(vec![Action::ClearOutput]),
         "clear scope" | "unset scope" => return Ok(vec![Action::ClearScope]),
         "clear program" | "unset program" => return Ok(vec![Action::ClearProgram]),
@@ -70,6 +74,14 @@ pub fn parse_command(input: &str) -> Result<Vec<Action>> {
         return Ok(vec![Action::SetProgram(program.to_string())]);
     }
 
+    if let Some(rest) = trimmed.strip_prefix("set ollama model ") {
+        let model = rest.trim();
+        if model.is_empty() {
+            return Err(anyhow!("set ollama model requires a model name"));
+        }
+        return Ok(vec![Action::SetOllamaModel(model.to_string())]);
+    }
+
     if let Some(rest) = trimmed.strip_prefix("show findings ") {
         let run_id = rest.trim();
         if run_id.is_empty() {
@@ -100,6 +112,22 @@ pub fn parse_command(input: &str) -> Result<Vec<Action>> {
         return Ok(vec![Action::AskModel(question.to_string())]);
     }
 
+    if let Some(rest) = trimmed.strip_prefix("chat ") {
+        let prompt = rest.trim();
+        if prompt.is_empty() {
+            return Err(anyhow!("chat requires a prompt"));
+        }
+        return Ok(vec![Action::AskOllama(prompt.to_string())]);
+    }
+
+    if let Some(rest) = trimmed.strip_prefix("ollama chat ") {
+        let prompt = rest.trim();
+        if prompt.is_empty() {
+            return Err(anyhow!("ollama chat requires a prompt"));
+        }
+        return Ok(vec![Action::AskOllama(prompt.to_string())]);
+    }
+
     if let Some(rest) = trimmed.strip_prefix("ask ") {
         let question = rest.trim();
         if question.is_empty() {
@@ -124,6 +152,9 @@ pub fn command_help() -> &'static [&'static str] {
         "show runs               print recent runs into the output pane",
         "show findings [run_id]  print findings for the selected run",
         "show logs               print telemetry into the output pane",
+        "models                  list installed Ollama models",
+        "set ollama model <name> select the direct Ollama chat model",
+        "chat <prompt>           ask the selected Ollama model directly",
         "theme <matrix|red|blue> switch the console theme",
         "oracle <question>       ask Chimera for guidance on the current target",
         "clear                   clear the output pane",

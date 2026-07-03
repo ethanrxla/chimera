@@ -22,8 +22,14 @@ RUN apt-get update && apt-get install -y \
     libgmp-dev libmpfr-dev binutils \
     poppler-utils \
     docker.io \
-    nmap masscan \
+    nmap masscan nikto \
+    curl wget \
  && rm -rf /var/lib/apt/lists/*
+
+# ── Install Go 1.23 (Kali's golang-go may be too old for projectdiscovery tools)
+RUN curl -fsSL https://go.dev/dl/go1.23.8.linux-amd64.tar.gz \
+      | tar -C /usr/local -xz
+ENV PATH="/usr/local/go/bin:$PATH"
 
 WORKDIR /app
 
@@ -95,12 +101,24 @@ RUN if [ "$ENABLE_PLAYWRIGHT" = "1" ]; then \
       && playwright install --with-deps; \
     fi
 
-RUN if [ "$ENABLE_SUBFINDER" = "1" ]; then \
-      apt-get update && apt-get install -y golang-go && rm -rf /var/lib/apt/lists/* \
-      && go install -v github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest; \
-    fi
+ENV PATH="/usr/local/go/bin:/root/go/bin:$PATH"
 
-ENV PATH="/root/go/bin:$PATH"
+# ── Go-based security tools ───────────────────────────────────────────────────
+RUN go install -v github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest \
+ && go install -v github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest \
+ && go install -v github.com/projectdiscovery/dnsx/cmd/dnsx@latest \
+ && go install -v github.com/owasp-amass/amass/v4/...@latest \
+ && ln -sf /root/go/bin/subfinder /usr/bin/subfinder \
+ && ln -sf /root/go/bin/nuclei /usr/bin/nuclei \
+ && ln -sf /root/go/bin/dnsx /usr/bin/dnsx \
+ && ln -sf /root/go/bin/amass /usr/bin/amass
+
+# ── Zypheron Go CLI ───────────────────────────────────────────────────────────
+COPY tools/zypheron/zypheron-go /app/tools/zypheron/zypheron-go
+RUN cd /app/tools/zypheron/zypheron-go && go mod tidy && go build -o /usr/local/bin/zypheron ./cmd/zypheron
+
+# ── Zypheron Python AI engine ─────────────────────────────────────────────────
+RUN pip3 install --no-cache-dir -e /app/tools/zypheron/zypheron-ai || true
 
 RUN if [ "$ENABLE_SECURITY" = "1" ]; then \
       pip3 install --no-cache-dir -r /tmp/requirements-zypheron-security.txt; \

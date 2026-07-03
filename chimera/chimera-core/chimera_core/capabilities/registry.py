@@ -6,7 +6,7 @@ from typing import Dict, List
 CAPABILITY_REGISTRY: Dict[str, List[str]] = {
     "api_rest": ["autoswagger", "bola_validator", "rate_limit_validator", "shannon"],
     "graphql": ["autoswagger", "shannon"],
-    "web_app": ["strix", "browser", "shannon"],
+    "web_app": ["strix", "zap", "hexstrike", "browser", "shannon"],
     "subdomain": ["subfinder", "zypheron", "shannon"],
     "llm_endpoint": ["shannon"],
     "auth": ["jwt_validator", "decepticon", "shannon"],

@@ -2,8 +2,9 @@
 HexStrike MCP Bridge — stdio transport.
 
 Spawned as a subprocess by Decepticon's MultiServerMCPClient when
-HEXSTRIKE_ENABLED=true.  Exposes five security-research MCP tools that
-proxy to the HexStrike API server (http://hexstrike:8888 by default).
+HEXSTRIKE_ENABLED=true.  Exposes high-level analysis tools plus direct
+HexStrike tool wrappers that proxy to the HexStrike API server
+(http://hexstrike:8888 by default).
 
 Each tool falls back to direct API usage (Firecrawl, SerpAPI, Anthropic)
 when the HexStrike server is unreachable.
@@ -28,8 +29,29 @@ SERVER_URL: str = _args.server.rstrip("/")
 ANTHROPIC_API_KEY: str = os.getenv("ANTHROPIC_API_KEY", "")
 FIRECRAWL_API_KEY: str = os.getenv("FIRECRAWL_API_KEY", "")
 SERPAPI_API_KEY: str = os.getenv("SERPAPI_API_KEY", "")
+LLM_API_BASE: str = os.getenv("LLM_API_BASE", "").rstrip("/")
+LLM_API_KEY: str = os.getenv("LLM_API_KEY", "dummy")
+LLM_MODEL: str = os.getenv("LLM_MODEL", "qwen2.5:7b")
 
 mcp = FastMCP("hexstrike")
+
+_DIRECT_TOOL_ROUTES = {
+    "httpx": "/api/tools/httpx",
+    "nmap": "/api/tools/nmap",
+    "nuclei": "/api/tools/nuclei",
+    "nikto": "/api/tools/nikto",
+    "gobuster": "/api/tools/gobuster",
+    "ffuf": "/api/tools/ffuf",
+    "dalfox": "/api/tools/dalfox",
+    "subfinder": "/api/tools/subfinder",
+    "waybackurls": "/api/tools/waybackurls",
+    "gau": "/api/tools/gau",
+    "masscan": "/api/tools/masscan",
+    "sqlmap": "/api/tools/sqlmap",
+    "curl": "/api/tools/curl",
+    "checksec": "/api/tools/checksec",
+    "anew": "/api/tools/anew",
+}
 
 
 # ---------------------------------------------------------------------------
@@ -46,10 +68,30 @@ def _server_post(path: str, payload: dict, timeout: int = 60) -> dict:
         return {"_fallback": True, "_error": str(exc)}
 
 
+def _server_tool(tool_name: str, payload: dict, timeout: int = 300) -> str:
+    route = _DIRECT_TOOL_ROUTES.get(tool_name)
+    if not route:
+        return json.dumps({"error": f"Unsupported HexStrike tool: {tool_name}"}, indent=2)
+    result = _server_post(route, payload, timeout=timeout)
+    return json.dumps(result, indent=2)
+
+
 def _claude_complete(prompt: str, max_tokens: int = 2048) -> str:
-    """Direct Anthropic call used as local fallback."""
+    """LLM call used as local fallback — prefers Ollama, falls back to Anthropic."""
+    if LLM_API_BASE:
+        try:
+            resp = httpx.post(
+                f"{LLM_API_BASE}/chat/completions",
+                headers={"Authorization": f"Bearer {LLM_API_KEY}"},
+                json={"model": LLM_MODEL, "messages": [{"role": "user", "content": prompt}], "max_tokens": max_tokens},
+                timeout=120,
+            )
+            resp.raise_for_status()
+            return resp.json()["choices"][0]["message"]["content"].strip()
+        except Exception as exc:
+            return json.dumps({"error": str(exc)})
     if not ANTHROPIC_API_KEY:
-        return json.dumps({"error": "ANTHROPIC_API_KEY not set — cannot run AI-backed fallback"})
+        return json.dumps({"error": "No LLM backend: set LLM_API_BASE or ANTHROPIC_API_KEY"})
     import anthropic  # lazy import; present in chimera/decepticon venvs
     client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
     msg = client.messages.create(
@@ -230,6 +272,104 @@ def api_security_probe(endpoint: str, method: str = "GET", token: str = "") -> s
     except Exception as exc:
         out["error"] = str(exc)
     return json.dumps(out, indent=2)
+
+
+@mcp.tool(
+    description=(
+        "Direct pass-through to a named HexStrike upstream tool route. "
+        "Use when you need one of the lower-level HexStrike tools that does not have a convenience wrapper."
+    )
+)
+def run_hexstrike_tool(tool_name: str, payload_json: str = "{}") -> str:
+    try:
+        payload = json.loads(payload_json) if payload_json.strip() else {}
+    except Exception as exc:
+        return json.dumps({"error": f"Invalid payload_json: {exc}"}, indent=2)
+    return _server_tool(tool_name, payload)
+
+
+@mcp.tool(description="Run httpx against one or more URLs or hosts.")
+def run_httpx(targets: str, additional_args: str = "-title -tech-detect -status-code") -> str:
+    return _server_tool("httpx", {"targets": targets, "additional_args": additional_args})
+
+
+@mcp.tool(description="Run nmap service fingerprinting against a host.")
+def run_nmap(target: str, scan_type: str = "-sCV", ports: str = "80,443,8080") -> str:
+    return _server_tool("nmap", {"target": target, "scan_type": scan_type, "ports": ports})
+
+
+@mcp.tool(description="Run masscan for fast port discovery against a host.")
+def run_masscan(target: str, ports: str = "80,443,8080", rate: str = "1000") -> str:
+    return _server_tool("masscan", {"target": target, "ports": ports, "rate": rate})
+
+
+@mcp.tool(description="Run nuclei templates against a target URL.")
+def run_nuclei(target: str, severity: str = "critical,high,medium", tags: str = "") -> str:
+    payload = {"target": target, "severity": severity}
+    if tags:
+        payload["tags"] = tags
+    return _server_tool("nuclei", payload)
+
+
+@mcp.tool(description="Run nikto against a target URL.")
+def run_nikto(target: str) -> str:
+    return _server_tool("nikto", {"target": target})
+
+
+@mcp.tool(description="Run gobuster for directory or file brute forcing.")
+def run_gobuster(url: str, mode: str = "dir", wordlist: str = "/usr/share/wordlists/dirb/common.txt") -> str:
+    return _server_tool("gobuster", {"url": url, "mode": mode, "wordlist": wordlist})
+
+
+@mcp.tool(description="Run ffuf against a fuzzable URL pattern.")
+def run_ffuf(url: str, additional_args: str = "-mc 200,301,302 -t 40") -> str:
+    return _server_tool("ffuf", {"url": url, "additional_args": additional_args})
+
+
+@mcp.tool(description="Run dalfox against a URL for XSS testing.")
+def run_dalfox(url: str, additional_args: str = "--silence --no-color") -> str:
+    return _server_tool("dalfox", {"url": url, "additional_args": additional_args})
+
+
+@mcp.tool(description="Run subfinder against a domain.")
+def run_subfinder(domain: str) -> str:
+    return _server_tool("subfinder", {"domain": domain})
+
+
+@mcp.tool(description="Collect historical URLs from Wayback Machine.")
+def run_waybackurls(domain: str) -> str:
+    return _server_tool("waybackurls", {"domain": domain})
+
+
+@mcp.tool(description="Gather archived URLs from multiple providers.")
+def run_gau(domain: str) -> str:
+    return _server_tool("gau", {"domain": domain})
+
+
+@mcp.tool(description="Run sqlmap against a target URL. Use only with explicit authorization.")
+def run_sqlmap(url: str, data: str = "", additional_args: str = "--batch --level=2") -> str:
+    payload = {"url": url, "additional_args": additional_args}
+    if data:
+        payload["data"] = data
+    return _server_tool("sqlmap", payload)
+
+
+@mcp.tool(description="Replay a curl request through HexStrike.")
+def run_curl(url: str, additional_args: str = "-i -s") -> str:
+    return _server_tool("curl", {"url": url, "additional_args": additional_args})
+
+
+@mcp.tool(description="Run checksec against a local file path inside the HexStrike environment.")
+def run_checksec(file_path: str, additional_args: str = "--format=json") -> str:
+    return _server_tool("checksec", {"file_path": file_path, "additional_args": additional_args})
+
+
+@mcp.tool(description="Append unique lines with anew semantics.")
+def run_anew(input_lines: str, output_file: str = "") -> str:
+    payload = {"input_lines": input_lines}
+    if output_file:
+        payload["output_file"] = output_file
+    return _server_tool("anew", payload)
 
 
 # ---------------------------------------------------------------------------

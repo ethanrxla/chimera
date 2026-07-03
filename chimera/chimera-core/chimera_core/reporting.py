@@ -66,6 +66,8 @@ class ReportBuilder:
         exploit_chains = 0
         rejected = 0
         unvalidated = 0
+        exploited = 0
+        potential = 0
         for finding in findings:
             counts[finding.severity] = counts.get(finding.severity, 0) + 1
             if finding.validation_status:
@@ -78,10 +80,15 @@ class ReportBuilder:
                 chained += 1
             if finding.finding_type == "EXPLOIT_CHAIN":
                 exploit_chains += 1
+            if (finding.exploit_status or "").upper() == "EXPLOITED":
+                exploited += 1
+            elif (finding.exploit_status or "").upper() == "POTENTIAL":
+                potential += 1
         highest_impact_chain = next(
             (finding.to_chain_summary() for finding in findings if finding.finding_type == "EXPLOIT_CHAIN"),
             None,
         )
+        verification = self._verification_summary()
         return {
             "run_id": run_id,
             "generated_at": datetime.now(timezone.utc).isoformat(),
@@ -93,10 +100,13 @@ class ReportBuilder:
             "rejected_findings": rejected,
             "unvalidated_findings": unvalidated,
             "highest_impact_chain": highest_impact_chain,
+            "verification": verification,
+            "exploit_status_counts": {"exploited": exploited, "potential": potential},
         }
 
     def _render_markdown(self, summary: Dict[str, object], findings: List[Finding]) -> str:
-        chain_findings = [finding for finding in findings if finding.finding_type == "EXPLOIT_CHAIN"]
+        deliverable_findings = self._deliverable_findings(findings)
+        chain_findings = [finding for finding in deliverable_findings if finding.finding_type == "EXPLOIT_CHAIN"]
         rejected_findings = [finding for finding in findings if finding.validation_status == "false_positive"]
         lines = [
             "# Chimera Report",
@@ -110,6 +120,11 @@ class ReportBuilder:
             f"- Confirmed/validated findings: {summary['validated_findings']}",
             f"- Unvalidated findings: {summary['unvalidated_findings']}",
             f"- Rejected findings: {summary['rejected_findings']}",
+            f"- Verification passes: {summary['verification']['passed']}",
+            f"- Verification failures: {summary['verification']['failed']}",
+            f"- Verification cache skips: {summary['verification']['cache_hits']}",
+            f"- Exploited findings: {summary['exploit_status_counts']['exploited']}",
+            f"- Potential findings retained: {summary['exploit_status_counts']['potential']}",
             f"- Highest impact chain: {summary['highest_impact_chain'] or 'none'}",
             "",
             "## Severity Counts",
@@ -120,6 +135,11 @@ class ReportBuilder:
         lines.append(f"Validated Findings: {summary['validated_findings']}")
         lines.append(f"Chained Findings: {summary['chained_findings']}")
         lines.append(f"Exploit Chains: {summary['exploit_chains']}")
+        lines.append(f"Verification Passes: {summary['verification']['passed']}")
+        lines.append(f"Verification Failures: {summary['verification']['failed']}")
+        lines.append(f"Verification Cache Skips: {summary['verification']['cache_hits']}")
+        lines.append(f"Exploited Findings: {summary['exploit_status_counts']['exploited']}")
+        lines.append(f"Potential Findings Retained: {summary['exploit_status_counts']['potential']}")
         lines.append("")
         if chain_findings:
             lines.append("## Exploit Chains")
@@ -130,7 +150,7 @@ class ReportBuilder:
                 lines.append("```")
             lines.append("")
         lines.append("## Findings")
-        for finding in findings:
+        for finding in deliverable_findings:
             lines.extend(self._render_finding_section(finding))
         if rejected_findings:
             lines.append("")
@@ -140,6 +160,25 @@ class ReportBuilder:
         lines.append("")
         return "\n".join(lines)
 
+    def _deliverable_findings(self, findings: List[Finding]) -> List[Finding]:
+        deliverable: List[Finding] = []
+        for finding in findings:
+            status = (finding.validation_status or "").lower()
+            exploit_status = (finding.exploit_status or "").upper()
+            if status in {"false_positive", "needs_replay"}:
+                continue
+            if exploit_status and exploit_status not in {"EXPLOITED"}:
+                continue
+            if status in {"confirmed", "verified", "exploited"}:
+                deliverable.append(finding)
+                continue
+            if finding.finding_type == "EXPLOIT_CHAIN":
+                deliverable.append(finding)
+                continue
+            if finding.evidence_refs:
+                deliverable.append(finding)
+        return deliverable
+
     def _render_finding_section(self, finding: Finding) -> List[str]:
         badge = (finding.validation_status or "unvalidated").upper()
         lines = [
@@ -147,6 +186,8 @@ class ReportBuilder:
             f"- Target: {finding.affected_target}",
             f"- Validation: {badge}",
         ]
+        if finding.exploit_status:
+            lines.append(f"- Exploit Status: {finding.exploit_status}")
         if finding.validation_reason:
             lines.append(f"- Reason: {finding.validation_reason}")
         if finding.confidence is not None:
@@ -203,6 +244,37 @@ class ReportBuilder:
             lines.append(f"CONFIDENCE: {finding.confidence:.2f}")
             lines.append(f"REPLAY: {len(finding.replay_steps)} steps, all artifacts stored")
         return lines
+
+    def _verification_summary(self) -> Dict[str, object]:
+        events_path = self.artifacts_dir / "events.jsonl"
+        summary = {
+            "passed": 0,
+            "failed": 0,
+            "cache_hits": 0,
+            "artifact_refs": [],
+        }
+        if not events_path.exists():
+            return summary
+        for raw_line in events_path.read_text(encoding="utf-8").splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            event_type = event.get("event_type")
+            payload = event.get("payload") or {}
+            if event_type == "verification_passed":
+                summary["passed"] += 1
+            elif event_type == "verification_failed":
+                summary["failed"] += 1
+            elif event_type == "verification_skipped" and payload.get("reason") == "cache_hit":
+                summary["cache_hits"] += 1
+            artifact_ref = payload.get("verification_result_ref")
+            if artifact_ref:
+                summary["artifact_refs"].append(artifact_ref)
+        return summary
 
     def _write_poc_bundles(self, findings: List[Finding], bundles_dir: Path) -> None:
         for finding in findings:

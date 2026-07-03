@@ -19,6 +19,7 @@ import urllib.request
 from pathlib import Path
 from typing import Any, Dict
 
+import httpx
 import pytest
 
 from chimera_core.orchestrator import Orchestrator
@@ -67,6 +68,35 @@ def _make_runtime(tmp_path: Path, scope_manifest: Dict[str, Any], run_id: str = 
         artifacts_root=artifacts_root,
         run_id=run_id,
     )
+
+
+class _Response:
+    def __init__(self, payload: dict) -> None:
+        self.payload = payload
+
+    def json(self) -> dict:
+        return self.payload
+
+    def raise_for_status(self) -> None:
+        return None
+
+
+def _make_hexstrike_transport(*, status_code: int = 200, body_excerpt: str = "ok"):
+    async def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content.decode("utf-8"))
+        return httpx.Response(
+            200,
+            json={
+                "status_code": status_code,
+                "headers": {"content-type": "text/html"},
+                "body_excerpt": body_excerpt,
+                "body_sha256": "abc123",
+                "request": payload,
+            },
+            request=request,
+        )
+
+    return httpx.MockTransport(handler)
 
 
 # ---------------------------------------------------------------------------
@@ -350,6 +380,230 @@ def test_full_golden_path_all_artifacts(tmp_path: Path) -> None:
         "summary.json",
     ):
         assert (run_dir / expected).exists(), f"Missing artifact: {expected}"
+
+
+def test_phased_autonomous_shannon_dag_executes_analysis_exploit_report(tmp_path: Path, monkeypatch) -> None:
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "shannon": {
+                    "enabled": True,
+                    "verify_availability": False,
+                    "base_url": "http://shannon:8080",
+                    "autonomous": {
+                        "enabled": True,
+                        "provider_preset": "ollama",
+                        "model": "qwen2.5-coder:7b",
+                        "base_url": "http://ollama:11434/v1",
+                        "max_turns": 8,
+                        "max_tool_calls": 10,
+                        "max_retries": 1,
+                        "reasoning_effort": "medium",
+                        "repo_path": "/tmp/repo",
+                        "browser_session_mode": "mediated",
+                        "zap_mcp_enabled": True,
+                        "role_assignments": {
+                            "exploit": {
+                                "provider_preset": "anthropic",
+                                "model": "claude-sonnet-4-20250514",
+                                "base_url": "",
+                                "max_turns": 12,
+                            },
+                            "report": {
+                                "provider_preset": "ollama",
+                                "model": "qwen2.5-coder:7b",
+                                "base_url": "http://ollama:11434/v1",
+                                "max_turns": 4,
+                            },
+                        },
+                    },
+                },
+                "pipeline": {"strategy": "phased_autonomous", "analysis_domains": ["authz"]},
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("CHIMERA_CONFIG", str(config_path))
+
+    class AutonomousPhaseClient:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, dict | None]] = []
+
+        def post(self, url: str, json=None, headers=None):
+            self.calls.append((url, json))
+            if url.endswith("/agent"):
+                role = str((json or {}).get("agent_role") or "")
+                if role == "analysis":
+                    return _Response(
+                        {
+                            "schema": "shannon.autonomous_agent_result.v1",
+                            "status": "completed",
+                            "request": {"agent_role": "analysis", "analysis_domain": "authz"},
+                            "runtime": {"provider_preset": "ollama", "model": "qwen2.5-coder:7b"},
+                            "artifacts": {"agent_trace_ref": "/tmp/analysis-trace.json"},
+                            "findings": [
+                                {
+                                    "candidate_id": "cand-admin",
+                                    "source": "shannon-agent",
+                                    "title": "Admin surface exposed at /admin",
+                                    "claim_type": "admin_exposure",
+                                    "severity_claimed": "medium",
+                                    "target": "https://www.example.com",
+                                    "endpoint": "/admin",
+                                    "params": [],
+                                    "evidence_refs": ["artifact://tool-call.json"],
+                                    "metadata": {
+                                        "target": {"method": "GET", "endpoint": "/admin", "params": None, "headers": None, "body": None},
+                                        "verifier_hint": "probe_admin_access",
+                                    },
+                                }
+                            ],
+                            "summary": {"finding_count": 1},
+                            "usage": {"total_tokens": 15},
+                        }
+                    )
+                if role == "exploit":
+                    return _Response(
+                        {
+                            "schema": "shannon.autonomous_agent_result.v1",
+                            "status": "completed",
+                            "request": {"agent_role": "exploit", "analysis_domain": "authz"},
+                            "runtime": {"provider_preset": "anthropic", "model": "claude-sonnet-4-20250514"},
+                            "artifacts": {"agent_trace_ref": "/tmp/exploit-trace.json"},
+                            "findings": [],
+                            "summary": {"finding_count": 0},
+                            "usage": {"total_tokens": 9},
+                        }
+                    )
+                if role == "report":
+                    return _Response(
+                        {
+                            "schema": "shannon.autonomous_agent_result.v1",
+                            "status": "completed",
+                            "request": {"agent_role": "report"},
+                            "runtime": {"provider_preset": "ollama", "model": "qwen2.5-coder:7b"},
+                            "artifacts": {"agent_trace_ref": "/tmp/report-trace.json"},
+                            "findings": [],
+                            "summary": {"finding_count": 0},
+                            "usage": {"total_tokens": 4},
+                        }
+                    )
+                raise AssertionError(f"unexpected role {role}")
+            if url.endswith("/plan"):
+                return _Response(
+                    {
+                        "verification_plan": {
+                            "verification_id": "ver-admin",
+                            "candidate_id": "cand-admin",
+                            "target": "https://www.example.com/admin",
+                            "claim_type": "admin_exposure",
+                            "checks": [
+                                {
+                                    "check_id": "check-1",
+                                    "probe_type": "http_admin_access_check",
+                                    "description": "verify anonymous access to admin surface",
+                                    "probe_input": {
+                                        "method": "GET",
+                                        "url": "https://www.example.com/admin",
+                                        "headers": {},
+                                        "query": {},
+                                        "body": None,
+                                        "follow_redirects": True,
+                                        "timeout_s": 30,
+                                    },
+                                    "success_condition": {
+                                        "type": "admin_exposure",
+                                        "rules": {
+                                            "status_in": [200],
+                                            "endpoint_contains_any": ["/admin"],
+                                            "body_contains_any": ["admin", "dashboard"],
+                                            "allow_path_only_match": True,
+                                        },
+                                    },
+                                }
+                            ],
+                            "required_artifact_kinds": ["http_request", "http_response", "http_normalized"],
+                            "planner_notes": "admin exposure",
+                        }
+                    }
+                )
+            if url.endswith("/validate"):
+                return _Response(
+                    {
+                        "decision": {
+                            "status": "verified",
+                            "final_claim_type": "admin_exposure",
+                            "severity": "medium",
+                            "rationale": "verified by deterministic replay",
+                            "duplicate_of": None,
+                            "required_evidence_refs_present": True,
+                        }
+                    }
+                )
+            raise AssertionError(f"unexpected url {url}")
+
+        def close(self) -> None:
+            return None
+
+    class _FakeHexstrikeReconAdapter:
+        def run(self, targets):
+            return {"findings": [], "artifacts": [], "raw_output_refs": ["{}"], "command": None}
+
+    scope_manifest = {"allowlist": ["https://www.example.com"], "denylist": []}
+    scope_graph, scope_policy = normalize_scope(scope_manifest)
+    plan = generate_plan(scope_graph, scope_policy, None)
+    phase_client = AutonomousPhaseClient()
+    hex_transport = _make_hexstrike_transport(status_code=200, body_excerpt="admin dashboard")
+
+    for task in plan.tasks.values():
+        if task.tool == "browser":
+            task.options["playwright_factory"] = _fake_playwright_factory
+        if task.tool == "shannon":
+            task.options["http_client"] = phase_client
+            task.options["hexstrike_transport"] = hex_transport
+            task.options["hexstrike_base_url"] = "http://hexstrike:8888"
+
+    runtime = _make_runtime(tmp_path, scope_manifest, run_id="run-autonomous-e2e")
+    runner = PlanRunner(
+        runtime=runtime,
+        max_workers=2,
+        stop_on_fail=False,
+        fixture_registry={
+            "strix": STRIX_FIXTURE,
+            "zap": str(tmp_path / "zap.json"),
+            "subfinder": str(tmp_path / "subfinder.jsonl"),
+        },
+    )
+
+    (tmp_path / "zap.json").write_text(json.dumps({"target": "https://www.example.com", "alerts": []}), encoding="utf-8")
+    (tmp_path / "subfinder.jsonl").write_text("", encoding="utf-8")
+
+    original_adapter_for_task = runner._adapter_for_task
+
+    def wrapped_adapter(task):
+        if task.tool == "hexstrike" and task.options.get("tool_name") == "recon":
+            return _FakeHexstrikeReconAdapter()
+        return original_adapter_for_task(task)
+
+    monkeypatch.setattr(runner, "_adapter_for_task", wrapped_adapter)
+
+    results = runner.execute(plan)
+
+    shannon_results = {result.task_id: result for result in results if result.task_id.startswith("shannon")}
+    assert "shannon-0-5" in shannon_results
+    assert "shannon-exploit-0-6" in shannon_results
+    assert "shannon-report-0-7" in shannon_results
+    assert shannon_results["shannon-0-5"].status == "completed"
+    assert shannon_results["shannon-exploit-0-6"].status == "completed"
+    assert shannon_results["shannon-report-0-7"].status == "completed"
+    assert any(f.finding_type == "ADMIN_EXPOSURE" for f in shannon_results["shannon-0-5"].findings)
+    role_posts = [
+        payload.get("agent_role")
+        for url, payload in phase_client.calls
+        if url.endswith("/agent") and isinstance(payload, dict)
+    ]
+    assert role_posts == ["analysis", "exploit", "report"]
 
 
 # ---------------------------------------------------------------------------

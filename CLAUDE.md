@@ -73,9 +73,10 @@ Secrets go in a `.env` file at the repo root (not committed). Key env vars:
 | **chimera-core** | Python / FastAPI | 8000 | Orchestrator, planner, validators, API |
 | **chimera-cli** | Rust / ratatui | — | TUI control surface; HTTP client to core |
 | **chimera-ui** | Python / Tkinter + xvfb | — | Browser launcher (Playwright) |
-| **shannon** | Python | 8080 | LLM verification / oracle service |
-| **sec-llm** | vLLM (local-llm profile) | 8001 | OpenAI-compatible local inference |
-| **hexstrike-mcp** | MCP bridge | 8888 | Tool bridge for MCP clients |
+| **shannon** | Python | 8080 | 3-stage LLM oracle (planner→executor→validator); executor has live HexStrike tool-call loop |
+| **hexstrike** | Python / FastAPI + Flask | 8888 | Unified tool execution server: 150+ active security tools (nmap, nuclei, gobuster, sqlmap, dalfox, ffuf, katana, subfinder, httpx, nikto, …) + LLM-powered analysis endpoints |
+| **ollama** | Ollama | 11434 | Local GPU inference for Shannon (qwen2.5-coder:7b planner/validator, whiterabbitneo-13b executor) |
+| **sec-llm** | vLLM (local-llm profile) | 8001 | OpenAI-compatible local inference (Ampere/Hopper only; use Ollama on RTX 50-series) |
 | **juice-shop** | OWASP Juice Shop (lab) | 3000 | Vulnerable practice target |
 
 ### chimera-core internals
@@ -108,6 +109,8 @@ chimera_core/
 1. **Scope** manifest (YAML) → `ScopeGraph` enforces allow/deny at every step
 2. **Planner** selects tool chain based on declared capabilities, not a fixed pipeline
 3. **Adapters** execute: `autoswagger` → `strix` → `shannon` (oracle)
+   - Strix supports partial-success: exit code ≠ 0 is accepted when `events.jsonl` contains `run.completed` or `vulnerabilities.csv` has data rows. Only the failed task's downstream dependents are blocked; independent chains continue.
+   - Shannon's executor stage has a live tool-call loop: it emits `<hexstrike_call>` blocks, Chimera dispatches to HexStrike, injects results back, and re-runs up to `HEXSTRIKE_MAX_TOOL_TURNS` times (default 3).
 4. **Validators** produce deterministic proof with replay artifacts
 5. **Chain analysis** escalates correlated low-severity findings into exploit chains
 6. **Sinks** persist JSON, markdown, and POC bundles (local or Supabase)
@@ -117,7 +120,20 @@ chimera_core/
 - **Scope-first**: Every run starts from a scope manifest; the runtime refuses out-of-scope requests.
 - **Evidence graph**: Findings carry prerequisites, proof artifacts, validation status, and chain links.
 - **Deterministic validation**: Shannon/LLMs suggest; validators prove. Findings without proof are hypotheses only.
+- **Deterministic chain analysis**: Exploit chains are inferred from explicit rule preconditions (`CHAIN_RULES` in `chimera_core/chain_analysis.py`), not LLM judgment. This means you can prove the analyzer is **complete** (fires on every valid rule match) and **sound** (never fires when preconditions don't hold) purely with in-memory `Finding` objects — no live target needed. Tests should call `synthesize_chains()` directly. Add a new `ChainRule` before writing a test for it; the test failing RED proves the rule is absent, passing GREEN proves it fires correctly.
 - **Capability routing**: The planner matches job requirements against adapter capabilities — there is no hard-coded tool order.
+
+## Mathematical specification
+
+`docs/spec/math_spec.md` is the formal specification of Chimera's runtime guarantees. It defines:
+- Scope enforcement as a set-language constraint with the `InScope(x)` predicate
+- Execution plans as DAGs with feasibility/precedence/rate-limit constraints
+- Event log invariants (monotone `seq`, run-local consistency)
+- The evidence graph `G=(V,E)` with typed nodes and labelled edges
+- Eight must-hold invariants (I-SCOPE-1 through I-ART-2, I-PROV-1)
+- Property-based test ideas (§9) tied directly to the repo schema
+
+When writing tests or validators, check `docs/spec/math_spec.md` §8–9 first — the invariants are the source of truth for what a test must prove.
 
 ## Scope manifests
 
@@ -128,11 +144,11 @@ Example files: `scope.yml`, `scope_juiceshop.yml`, `scope_test.yml` at the repo 
 `tools/` contains bundled integrations shipped alongside core:
 
 - `autoswagger/` – OpenAPI spec discovery and endpoint enumeration
-- `strix/` – Active testing engine
-- `shannon/` / `shannon-svc/` – LLM oracle (also runs as a standalone service)
+- `strix/` – Active testing engine; includes 19 HexStrike tool wrappers (`strix/strix/tools/hexstrike/`)
+- `shannon/` / `shannon-svc/` – LLM oracle (also runs as a standalone service); executor stage calls HexStrike tools live during analysis
+- `hexstrike-mcp/` – Unified tool execution server: proxies upstream [hexstrike-ai](https://github.com/0x4m4/hexstrike-ai) (150+ tools, Flask, port 8887) plus our own FastAPI LLM-analysis endpoints (port 8889) behind a single proxy on port 8888. The 19 tools accessible from Strix/Shannon map to `/api/tools/<name>` routes on the Flask upstream.
 - `zypheron/` – Extended recon
 - `vibe-pentester/` – Vibe-mode test runner
 - `decepticon/` – Deception/honeypot utilities
-- `hexstrike-mcp/` – MCP bridge
 
 `tools/registry.json` is the canonical list of available tools and their capabilities.

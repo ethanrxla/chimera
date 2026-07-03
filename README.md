@@ -109,13 +109,16 @@ export SHANNON_OPENAI_API_KEY=dummy
 docker compose up -d shannon chimera-core chimera-ui chimera-cli
 ```
 
-Or run a local GPU model via Ollama + GGUF — the recommended path for RTX 50-series (Blackwell):
+For the current stack split, keep Strix on `openai/gpt-4o-mini` and use Ollama for Shannon. Shannon now defaults its planner and validator to `qwen2.5-coder:7b`, while the executor stays on `whiterabbitneo-13b`.
 
 ```bash
 # 1. Start Ollama with GPU
 COMPOSE_PROFILES=ollama docker compose up -d ollama
 
-# 2. Pull the model (one-time, ~8 GB download)
+# 2. Pull Shannon's planner/validator model (one-time)
+docker exec ollama-gpu ollama pull qwen2.5-coder:7b
+
+# Optional: also confirm the executor model is available
 docker exec ollama-gpu ollama pull hf.co/bartowski/WhiteRabbitNeo-13B-v1-GGUF:Q4_K_M
 
 # 3. Confirm the model name Ollama assigned
@@ -125,18 +128,19 @@ docker exec ollama-gpu ollama list
 COMPOSE_PROFILES=ollama,lab docker compose up -d shannon chimera-core chimera-cli juice-shop
 ```
 
-Shannon's default `SHANNON_OPENAI_BASE_URL` already points to `http://ollama:11434/v1`. The only `.env` values needed:
+Strix stays on OpenAI by default:
+
+```bash
+STRIX_LLM=openai/gpt-4o-mini
+```
+
+Shannon's default `SHANNON_OPENAI_BASE_URL` already points to `http://ollama:11434/v1`. The `.env` values to keep aligned are:
 
 ```bash
 SHANNON_PROVIDER=openai_compatible
-SHANNON_MODEL=hf.co/bartowski/WhiteRabbitNeo-13B-v1-GGUF:Q4_K_M
-```
-
-**7B fallback** if 13B exceeds VRAM (~4 GB instead of ~8 GB):
-
-```bash
-docker exec ollama-gpu ollama pull hf.co/bartowski/WhiteRabbitNeo-V3-7B-GGUF:IQ4_XS
-# then set: SHANNON_MODEL=hf.co/bartowski/WhiteRabbitNeo-V3-7B-GGUF:IQ4_XS
+SHANNON_PLANNER_MODEL=qwen2.5-coder:7b
+SHANNON_EXECUTOR_MODEL=whiterabbitneo-13b
+SHANNON_VALIDATOR_MODEL=qwen2.5-coder:7b
 ```
 
 > **Compose v5 note:** `--profile` flags combined with explicit service names trigger a validation bug in Docker Compose v5 (`no such service`). Use `COMPOSE_PROFILES=` as an environment variable instead — it is evaluated before service name resolution.
@@ -222,6 +226,9 @@ docker run --rm --gpus all nvidia/cuda:12.6.0-base-ubuntu24.04 nvidia-smi
 See the [Local Security Model Service](#local-security-model-service) section above for the full setup. Quick reference for the GGUF pull commands:
 
 ```bash
+# Shannon planner / validator
+docker exec ollama-gpu ollama pull qwen2.5-coder:7b
+
 # 13B Q4_K_M (~8 GB VRAM) — recommended for RTX 5070
 docker exec ollama-gpu ollama pull hf.co/bartowski/WhiteRabbitNeo-13B-v1-GGUF:Q4_K_M
 
@@ -290,3 +297,37 @@ The current repo state is centered on:
 - validating live end-to-end runs against local lab targets
 - wiring the Rust CLI cleanly into the newer parser, oracle, chain, and replay APIs
 - hardening browser-backed execution and packaging
+
+
+# docker compose --profile lab up -d shannon chimera-core chimera-cli juice-shop
+
+# run the TUI
+# ~/whitehat/chimera/chimera/chimera-cli/target/release/chimera-cli
+
+# docker compose up -d
+
+1. Ollama — listing models and talking to WhiteRabbitNeo
+
+  # List models
+  # sg docker -c "docker exec ollama-gpu ollama list"
+
+  # Chat interactively in the terminal
+  # sg docker -c "docker exec -it ollama-gpu ollama run whiterabbitneo-13b"
+  # sg docker -c "docker exec -it ollama-gpu ollama run dolphin-llama3:8b"
+  # sg docker -c "docker exec -it ollama-gpu ollama run qwen2.5-coder:7b"
+
+  # One-shot query (pipe input)
+  # echo "Write a Python script that tests for open redirects" | \
+  #   sg docker -c "docker exec -i ollama-gpu ollama run whiterabbitneo-13b"
+
+  # Via REST API (from host, Ollama is port-forwarded or use docker exec)
+  # sg docker -c "docker exec ollama-gpu curl -s http://localhost:11434/api/chat -d '{
+  #   \"model\": \"whiterabbitneo-13b\",
+  #   \"messages\": [{\"role\":\"user\",\"content\":\"Explain IDOR vulnerabilities\"}],
+  #   \"stream\": false
+  # }'"
+
+  # Or via the OpenAI-compatible endpoint that Shannon uses:
+  # sg docker -c "docker exec ollama-gpu curl -s http://localhost:11434/v1/chat/completions \
+  #   -H 'Content-Type: application/json' \
+  #   -d '{\"model\":\"qwen2.5-coder:7b\",\"messages\":[{\"role\":\"user\",\"content\":\"Hello\"}]}'"

@@ -12,10 +12,11 @@ use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::Frame;
 
 pub fn draw(frame: &mut Frame, app: &App, theme: &Theme) {
+    let header_height = if app.run_is_active() { 4 } else { 5 };
     let layout = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(5),
+            Constraint::Length(header_height),
             Constraint::Min(12),
             Constraint::Length(2),
             Constraint::Length(4),
@@ -24,16 +25,28 @@ pub fn draw(frame: &mut Frame, app: &App, theme: &Theme) {
 
     let body = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Length(24),
-            Constraint::Percentage(36),
-            Constraint::Percentage(44),
-        ])
+        .constraints(if app.run_is_active() {
+            [
+                Constraint::Length(20),
+                Constraint::Percentage(28),
+                Constraint::Percentage(52),
+            ]
+        } else {
+            [
+                Constraint::Length(22),
+                Constraint::Percentage(32),
+                Constraint::Percentage(46),
+            ]
+        })
         .split(layout[1]);
 
     let center = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(16), Constraint::Min(8)])
+        .constraints(if app.run_is_active() {
+            [Constraint::Length(14), Constraint::Min(8)]
+        } else {
+            [Constraint::Length(16), Constraint::Min(8)]
+        })
         .split(body[1]);
 
     header::render(frame, layout[0], app, theme);

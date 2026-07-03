@@ -5,8 +5,9 @@ import hashlib
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Any, Dict, Optional
 
+import httpx
 import yaml
 from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse, Response
@@ -22,8 +23,10 @@ from chimera_core.adapters.browser_adapter import BrowserAdapter
 from chimera_core.adapters.shannon_adapter import ShannonAdapter
 from chimera_core.capabilities.browser.browser_task import BrowserTask
 from chimera_core.api.browser_sessions import PersistentBrowserSession
+from chimera_core.api.terminal_sessions import PersistentTerminalSession
 from chimera_core.api.input_parser import interpret_input
 from chimera_core.api.oracle import heuristic_oracle
+from chimera_core.policy.kernel import ExecutionContext, PolicyDecision, PolicyKernel, ToolCall
 from chimera_core.modules.recon_gatherers.orchestrator import (
     run_zypheron_and_persist,
     run_vibepentester_and_persist,
@@ -37,6 +40,18 @@ from chimera_core.run_manager import RunManager
 
 
 router = APIRouter()
+
+
+def _zap_base_url() -> str:
+    import os
+
+    return str(os.getenv("ZAP_BASE_URL") or "http://127.0.0.1:8080").rstrip("/")
+
+
+def _zap_api_key() -> str:
+    import os
+
+    return str(os.getenv("ZAP_API_KEY") or "")
 
 
 def _load_scope(scope_text: str) -> Dict[str, object]:
@@ -482,6 +497,72 @@ def _default_scope_manifest(target: str) -> Dict[str, object]:
     return {"allowlist": [target], "denylist": []}
 
 
+def _policy_context_from_payload(payload: Dict[str, object]) -> ExecutionContext:
+    scope_summary = payload.get("scope_summary")
+    if isinstance(scope_summary, dict):
+        return ExecutionContext(
+            allowlist=list(scope_summary.get("allowlist") or []),
+            denylist=list(scope_summary.get("denylist") or []),
+            allowed_methods=list(scope_summary.get("allowed_methods") or payload.get("allowed_methods") or []),
+            runtime_mode=str(scope_summary.get("runtime_mode") or payload.get("runtime_mode") or "live"),
+        )
+    scope_text = payload.get("scope_text")
+    if scope_text:
+        manifest = _load_scope(str(scope_text))
+        return ExecutionContext(
+            allowlist=list(manifest.get("allowlist") or []),
+            denylist=list(manifest.get("denylist") or []),
+            allowed_methods=list(manifest.get("allowed_methods") or []),
+            runtime_mode=str(payload.get("runtime_mode") or "live"),
+        )
+    target = str(payload.get("target") or "").strip()
+    return ExecutionContext(
+        allowlist=[target] if target else [],
+        denylist=[],
+        allowed_methods=list(payload.get("allowed_methods") or []),
+        runtime_mode=str(payload.get("runtime_mode") or "live"),
+    )
+
+
+def _policy_gate_or_raise(request: Request, payload: Dict[str, object], *, tool: str, action_class: str, risk_class: str | None = None) -> PolicyDecision:
+    call = ToolCall(
+        tool=tool,
+        target=str(payload.get("target") or "").strip() or None,
+        action_class=action_class,
+        risk_class=risk_class,
+        method=str(payload.get("method") or "").upper() or None,
+        command=[str(item) for item in list(payload.get("command") or [])],
+        browser_actions=[str(item) for item in list(payload.get("browser_actions") or [])],
+        has_env_vars=bool(payload.get("has_env_vars", False)),
+        file_upload=bool(payload.get("file_upload", False)),
+        metadata=dict(payload.get("metadata") or {}),
+    )
+    context = _policy_context_from_payload(payload)
+    kernel = getattr(request.app.state, "policy_kernel", None) or PolicyKernel()
+    decision = kernel.evaluate(call, context)
+    if decision.decision != "allow":
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "decision": decision.to_dict(),
+                "tool_call": call.to_dict(),
+                "context": context.to_dict(),
+            },
+        )
+    return decision
+
+
+async def _zap_api_get(path: str, *, params: Dict[str, object]) -> Dict[str, object]:
+    query = {key: value for key, value in params.items() if value not in (None, "", [])}
+    api_key = _zap_api_key()
+    if api_key:
+        query["apikey"] = api_key
+    async with httpx.AsyncClient(timeout=30) as client:
+        response = await client.get(f"{_zap_base_url()}{path}", params=query)
+        response.raise_for_status()
+        return dict(response.json() or {})
+
+
 def _service_runtime(
     request: Request,
     *,
@@ -517,6 +598,10 @@ def _browser_sessions(request: Request) -> Dict[str, Dict[str, object]]:
     return request.app.state.browser_sessions
 
 
+def _terminal_sessions(request: Request) -> Dict[str, Dict[str, object]]:
+    return request.app.state.terminal_sessions
+
+
 def _shannon_tasks(request: Request) -> Dict[str, Dict[str, object]]:
     return request.app.state.shannon_tasks
 
@@ -536,11 +621,56 @@ def _sanitize_browser_session(session: Dict[str, object]) -> Dict[str, object]:
         "target": session.get("target"),
         "scope_manifest": session.get("scope_manifest"),
         "headless": session.get("headless", True),
+        "observable": session.get("observable", False),
         "created_at": session.get("created_at"),
         "updated_at": session.get("updated_at"),
         "last_action": session.get("last_action"),
         "artifacts_dir": session.get("artifacts_dir"),
+        "last_capture_artifact_ref": session.get("last_capture_artifact_ref"),
+        "last_screenshot_artifact_ref": session.get("last_screenshot_artifact_ref"),
     }
+
+
+def _sanitize_terminal_session(session: Dict[str, object]) -> Dict[str, object]:
+    return {
+        "session_id": session.get("session_id"),
+        "run_id": session.get("run_id"),
+        "target": session.get("target"),
+        "scope_manifest": session.get("scope_manifest"),
+        "created_at": session.get("created_at"),
+        "updated_at": session.get("updated_at"),
+        "last_action": session.get("last_action"),
+        "artifacts_dir": session.get("artifacts_dir"),
+        "command": session.get("command"),
+        "cwd": session.get("cwd"),
+        "cols": session.get("cols"),
+        "rows": session.get("rows"),
+        "transcript_artifact_ref": session.get("transcript_artifact_ref"),
+        "status": session.get("status"),
+        "pid": session.get("pid"),
+        "exit_code": session.get("exit_code"),
+    }
+
+
+def _browser_policy_payload(target: str | None, actions: list[str], scope_manifest: Dict[str, object]) -> Dict[str, object]:
+    action_class = "low_impact" if any(action in {"click", "fill", "execute_js"} for action in actions) else "passive"
+    return {
+        "target": target,
+        "scope_summary": scope_manifest,
+        "method": "GET",
+        "browser_actions": actions,
+        "action_class": action_class,
+        "risk_class": action_class,
+    }
+
+
+def _assert_terminal_command_allowed(request: Request, command: list[str]) -> None:
+    if not command:
+        raise HTTPException(status_code=400, detail="command is required")
+    allowed = set(getattr(request.app.state, "runtime_allowlist", []) or [])
+    binary = Path(command[0]).name
+    if binary not in allowed:
+        raise HTTPException(status_code=400, detail=f"command binary {binary!r} is not allowlisted")
 
 
 def _load_json_artifact(artifacts_dir: Path, filename: str):
@@ -589,7 +719,7 @@ async def plan_run(payload: Dict[str, object]):
         live_confirm_token=live_confirm if live else None,
         max_workers=_clamp_int(payload.get("max_workers"), 1, 8, 2),
         rps=float(_clamp_int(payload.get("rate_limit_rps"), 1, 50, 10)),
-        timeout_s=_clamp_int(payload.get("per_task_timeout_s"), 5, 1200, 1200),
+        timeout_s=_clamp_int(payload.get("per_task_timeout_s"), 5, 7200, 3600),
     )
     safety = _safety_state(policy, mode="live" if live else "fixture")
 
@@ -654,6 +784,129 @@ async def parse_operator_input(payload: Dict[str, object]):
     return JSONResponse(interpret_input(text))
 
 
+@router.post("/policy/evaluate")
+async def evaluate_policy(request: Request, payload: Dict[str, object]):
+    tool = str(payload.get("tool") or "").strip()
+    if not tool:
+        raise HTTPException(status_code=400, detail="tool is required")
+    call = ToolCall(
+        tool=tool,
+        target=str(payload.get("target") or "").strip() or None,
+        action_class=str(payload.get("action_class") or "passive"),
+        risk_class=str(payload.get("risk_class") or "") or None,
+        method=str(payload.get("method") or "").upper() or None,
+        command=[str(item) for item in list(payload.get("command") or [])],
+        browser_actions=[str(item) for item in list(payload.get("browser_actions") or [])],
+        has_env_vars=bool(payload.get("has_env_vars", False)),
+        file_upload=bool(payload.get("file_upload", False)),
+        metadata=dict(payload.get("metadata") or {}),
+    )
+    context = _policy_context_from_payload(payload)
+    kernel = getattr(request.app.state, "policy_kernel", None) or PolicyKernel()
+    decision = kernel.evaluate(call, context)
+    return JSONResponse(
+        {
+            "decision": decision.to_dict(),
+            "tool_call": call.to_dict(),
+            "context": context.to_dict(),
+        }
+    )
+
+
+@router.post("/zap/sites")
+async def zap_get_sites(request: Request, payload: Dict[str, object]):
+    _policy_gate_or_raise(request, payload, tool="zap", action_class="passive", risk_class="passive")
+    target = str(payload.get("target") or "").strip()
+    data = await _zap_api_get("/JSON/core/view/sites/", params={})
+    sites = list(data.get("sites") or [])
+    if target:
+        sites = [site for site in sites if str(site).startswith(target)]
+    return JSONResponse({"target": target or None, "sites": sites, "count": len(sites), "source": "zap_rest"})
+
+
+@router.post("/zap/spider")
+async def zap_spider(request: Request, payload: Dict[str, object]):
+    target = str(payload.get("target") or "").strip()
+    if not target:
+        raise HTTPException(status_code=400, detail="target is required")
+    _policy_gate_or_raise(request, payload, tool="zap", action_class="low_impact", risk_class="passive")
+    recurse = bool(payload.get("recurse", True))
+    max_children = _clamp_int(payload.get("max_children"), 1, 500, 25)
+    started = await _zap_api_get(
+        "/JSON/spider/action/scan/",
+        params={
+            "url": target,
+            "recurse": str(recurse).lower(),
+            "maxChildren": max_children,
+        },
+    )
+    scan_id = str(started.get("scan") or "")
+    status = {}
+    results: list[str] = []
+    results_limit = _clamp_int(payload.get("results_limit"), 1, 1000, 100)
+    if scan_id:
+        status = await _zap_api_get("/JSON/spider/view/status/", params={"scanId": scan_id})
+        try:
+            result_payload = await _zap_api_get("/JSON/spider/view/results/", params={"scanId": scan_id})
+            results = list(result_payload.get("results") or [])[:results_limit]
+        except Exception:
+            results = []
+    return JSONResponse(
+        {
+            "target": target,
+            "scan_id": scan_id,
+            "status": status.get("status"),
+            "recurse": recurse,
+            "max_children": max_children,
+            "results": results,
+            "results_count": len(results),
+            "results_limit": results_limit,
+            "source": "zap_rest",
+        }
+    )
+
+
+@router.post("/zap/spider/results")
+async def zap_spider_results(request: Request, payload: Dict[str, object]):
+    _policy_gate_or_raise(request, payload, tool="zap", action_class="passive", risk_class="passive")
+    scan_id = str(payload.get("scan_id") or "").strip()
+    if not scan_id:
+        raise HTTPException(status_code=400, detail="scan_id is required")
+    limit = _clamp_int(payload.get("limit"), 1, 1000, 200)
+    data = await _zap_api_get("/JSON/spider/view/results/", params={"scanId": scan_id})
+    results = list(data.get("results") or [])[:limit]
+    return JSONResponse(
+        {
+            "scan_id": scan_id,
+            "results": results,
+            "count": len(results),
+            "limit": limit,
+            "source": "zap_rest",
+        }
+    )
+
+
+@router.post("/zap/alerts")
+async def zap_list_alerts(request: Request, payload: Dict[str, object]):
+    _policy_gate_or_raise(request, payload, tool="zap", action_class="passive", risk_class="passive")
+    target = str(payload.get("target") or "").strip()
+    start = _clamp_int(payload.get("start"), 0, 100000, 0)
+    count = _clamp_int(payload.get("count"), 1, 500, 20)
+    params: Dict[str, object] = {"start": start, "count": count}
+    if target:
+        params["baseurl"] = target
+    data = await _zap_api_get("/JSON/core/view/alerts/", params=params)
+    alerts = list(data.get("alerts") or [])
+    return JSONResponse(
+        {
+            "target": target or None,
+            "alerts": alerts,
+            "count": len(alerts),
+            "source": "zap_rest",
+        }
+    )
+
+
 @router.post("/shannon/oracle")
 async def shannon_oracle(request: Request, payload: Dict[str, object]):
     question = str(payload.get("question") or "").strip()
@@ -690,25 +943,36 @@ async def create_browser_session(request: Request, payload: Dict[str, object]):
     if not target:
         raise HTTPException(status_code=400, detail="target is required")
     scope_text = payload.get("scope_text")
-    scope_manifest = _load_scope(scope_text) if scope_text else _default_scope_manifest(target)
+    scope_summary = payload.get("scope_summary")
+    if isinstance(scope_summary, dict):
+        scope_manifest = dict(scope_summary)
+    else:
+        scope_manifest = _load_scope(scope_text) if scope_text else _default_scope_manifest(target)
     session_id = str(uuid.uuid4())
     run_id = str(payload.get("run_id") or f"browser-session-{session_id[:12]}")
+    observable = bool(payload.get("observable", False))
+    headless = bool(payload.get("headless", not observable))
+    artifacts_dir = Path(request.app.state.artifacts_root) / run_id / "browser" / session_id
     session = {
         "session_id": session_id,
         "run_id": run_id,
         "target": target,
         "scope_manifest": scope_manifest,
-        "headless": bool(payload.get("headless", True)),
+        "headless": headless,
+        "observable": observable,
         "auth_cookies": dict(payload.get("auth_cookies") or {}),
         "created_at": datetime.now(timezone.utc).isoformat(),
         "updated_at": datetime.now(timezone.utc).isoformat(),
         "last_action": "created",
-        "artifacts_dir": str(Path(request.app.state.artifacts_root) / run_id / "browser"),
+        "artifacts_dir": str(artifacts_dir),
         "backend": PersistentBrowserSession(
             target=target,
-            headless=bool(payload.get("headless", True)),
+            headless=headless,
             auth_cookies=dict(payload.get("auth_cookies") or {}),
             playwright_factory=getattr(request.app.state, "browser_playwright_factory", None),
+            session_id=session_id,
+            artifacts_dir=str(artifacts_dir),
+            observable=observable,
         ),
     }
     _browser_sessions(request)[session_id] = session
@@ -761,12 +1025,21 @@ async def browser_session_analyze(request: Request, session_id: str, payload: Di
     if not session:
         raise HTTPException(status_code=404, detail="Browser session not found")
     target = str(payload.get("url") or session["target"])
+    _policy_gate_or_raise(
+        request,
+        _browser_policy_payload(target, ["navigate", "wait_for_navigation"], session["scope_manifest"]),
+        tool="browser",
+        action_class="passive",
+        risk_class="passive",
+    )
     adapter = _browser_adapter_for_session(request, session, task_id=f"analyze-{uuid.uuid4().hex[:8]}")
     backend = session.get("backend")
     capture = await backend.analyze(target) if backend is not None else await adapter.analyze_page(target, auth_cookies=session.get("auth_cookies"))
     findings = adapter.normalize(capture)
     session["updated_at"] = datetime.now(timezone.utc).isoformat()
     session["last_action"] = "analyze"
+    session["last_capture_artifact_ref"] = capture.get("capture_artifact_ref")
+    session["last_screenshot_artifact_ref"] = capture.get("screenshot_artifact_ref")
     return JSONResponse({"session": _sanitize_browser_session(session), "capture": capture, "findings": [item.to_dict() for item in findings]})
 
 
@@ -794,14 +1067,27 @@ async def browser_session_execute(request: Request, session_id: str, payload: Di
     task_payload = payload.get("task")
     if not isinstance(task_payload, dict):
         raise HTTPException(status_code=400, detail="task object is required")
-    target = str(payload.get("url") or session["target"])
-    adapter = _browser_adapter_for_session(request, session, task_id=f"execute-{uuid.uuid4().hex[:8]}")
+    requested_url = payload.get("url")
+    target = None if requested_url is None else str(requested_url)
     task = BrowserTask(**task_payload)
+    _policy_gate_or_raise(
+        request,
+        _browser_policy_payload(target or str(session["target"]), [action.type.value for action in task.actions], session["scope_manifest"]),
+        tool="browser",
+        action_class="low_impact" if any(action.type.value in {"click", "fill", "execute_js"} for action in task.actions) else "passive",
+        risk_class="low_impact" if any(action.type.value in {"click", "fill", "execute_js"} for action in task.actions) else "passive",
+    )
+    adapter = _browser_adapter_for_session(request, session, task_id=f"execute-{uuid.uuid4().hex[:8]}")
     backend = session.get("backend")
-    capture = await backend.execute(task, url=target) if backend is not None else await adapter.analyze_page(target, auth_cookies=session.get("auth_cookies"))
+    if backend is not None:
+        capture = await backend.execute(task, url=target)
+    else:
+        capture = await adapter.analyze_page(target or str(session["target"]), auth_cookies=session.get("auth_cookies"))
     findings = adapter.normalize(capture)
     session["updated_at"] = datetime.now(timezone.utc).isoformat()
     session["last_action"] = "execute"
+    session["last_capture_artifact_ref"] = capture.get("capture_artifact_ref")
+    session["last_screenshot_artifact_ref"] = capture.get("screenshot_artifact_ref")
     return JSONResponse({"session": _sanitize_browser_session(session), "capture": capture, "findings": [item.to_dict() for item in findings]})
 
 
@@ -824,7 +1110,270 @@ async def browser_session_trace_xss(request: Request, session_id: str, payload: 
     findings = adapter._findings_from_trace_result(target, trace)
     session["updated_at"] = datetime.now(timezone.utc).isoformat()
     session["last_action"] = "trace-xss"
+    capture = trace.get("capture") if isinstance(trace.get("capture"), dict) else {}
+    session["last_capture_artifact_ref"] = capture.get("capture_artifact_ref")
+    session["last_screenshot_artifact_ref"] = capture.get("screenshot_artifact_ref")
     return JSONResponse({"session": _sanitize_browser_session(session), "trace": trace, "findings": [item.to_dict() for item in findings]})
+
+
+@router.get("/browser/sessions/{session_id}/console")
+async def browser_session_console(request: Request, session_id: str, limit: int = Query(default=200, ge=1, le=2000)):
+    session = _browser_sessions(request).get(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Browser session not found")
+    _policy_gate_or_raise(
+        request,
+        _browser_policy_payload(str(session["target"]), ["extract_console"], session["scope_manifest"]),
+        tool="browser",
+        action_class="passive",
+        risk_class="passive",
+    )
+    backend = session.get("backend")
+    if backend is None:
+        raise HTTPException(status_code=409, detail="Browser session backend is unavailable")
+    payload = await backend.get_console(limit=limit)
+    session["updated_at"] = datetime.now(timezone.utc).isoformat()
+    session["last_action"] = "get-console"
+    return JSONResponse({"session": _sanitize_browser_session(session), **payload})
+
+
+@router.get("/browser/sessions/{session_id}/network")
+async def browser_session_network(request: Request, session_id: str, limit: int = Query(default=200, ge=1, le=2000)):
+    session = _browser_sessions(request).get(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Browser session not found")
+    _policy_gate_or_raise(
+        request,
+        _browser_policy_payload(str(session["target"]), ["extract_dom"], session["scope_manifest"]),
+        tool="browser",
+        action_class="passive",
+        risk_class="passive",
+    )
+    backend = session.get("backend")
+    if backend is None:
+        raise HTTPException(status_code=409, detail="Browser session backend is unavailable")
+    payload = await backend.get_network(limit=limit)
+    session["updated_at"] = datetime.now(timezone.utc).isoformat()
+    session["last_action"] = "get-network"
+    return JSONResponse({"session": _sanitize_browser_session(session), **payload})
+
+
+@router.get("/browser/sessions/{session_id}/screenshot")
+async def browser_session_screenshot(request: Request, session_id: str):
+    session = _browser_sessions(request).get(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Browser session not found")
+    _policy_gate_or_raise(
+        request,
+        _browser_policy_payload(str(session["target"]), ["screenshot"], session["scope_manifest"]),
+        tool="browser",
+        action_class="passive",
+        risk_class="passive",
+    )
+    backend = session.get("backend")
+    if backend is None:
+        raise HTTPException(status_code=409, detail="Browser session backend is unavailable")
+    screenshot = await backend.get_screenshot_bytes()
+    if not screenshot:
+        raise HTTPException(status_code=404, detail="No screenshot artifact is available for this session")
+    session["updated_at"] = datetime.now(timezone.utc).isoformat()
+    session["last_action"] = "get-screenshot"
+    return Response(content=screenshot, media_type="image/png")
+
+
+@router.post("/terminal/sessions")
+async def create_terminal_session(request: Request, payload: Dict[str, object]):
+    command = [str(item) for item in list(payload.get("command") or [])]
+    _assert_terminal_command_allowed(request, command)
+    target = str(payload.get("target") or "").strip() or None
+    scope_text = payload.get("scope_text")
+    scope_summary = payload.get("scope_summary")
+    if isinstance(scope_summary, dict):
+        scope_manifest = dict(scope_summary)
+    else:
+        scope_manifest = _load_scope(scope_text) if scope_text else _default_scope_manifest(target or "localhost")
+    _policy_gate_or_raise(
+        request,
+        {
+            "target": target,
+            "command": command,
+            "scope_summary": scope_manifest,
+            "action_class": "low_impact",
+            "risk_class": "low_impact",
+            "metadata": {"binary": Path(command[0]).name},
+        },
+        tool="terminal",
+        action_class="low_impact",
+        risk_class="low_impact",
+    )
+    session_id = str(uuid.uuid4())
+    run_id = str(payload.get("run_id") or f"terminal-session-{session_id[:12]}")
+    cols = _clamp_int(payload.get("cols"), 40, 400, 120)
+    rows = _clamp_int(payload.get("rows"), 10, 200, 36)
+    cwd = str(payload.get("cwd") or "").strip() or None
+    artifacts_dir = Path(request.app.state.artifacts_root) / run_id / "terminal" / session_id
+    backend = PersistentTerminalSession(
+        session_id=session_id,
+        command=command,
+        artifacts_dir=str(artifacts_dir),
+        cwd=cwd,
+        cols=cols,
+        rows=rows,
+    )
+    metadata = await backend.start()
+    session = {
+        "session_id": session_id,
+        "run_id": run_id,
+        "target": target,
+        "scope_manifest": scope_manifest,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+        "last_action": "created",
+        "artifacts_dir": str(artifacts_dir),
+        "backend": backend,
+        **metadata,
+    }
+    _terminal_sessions(request)[session_id] = session
+    return JSONResponse(_sanitize_terminal_session(session), status_code=201)
+
+
+@router.get("/terminal/sessions/{session_id}")
+async def get_terminal_session(request: Request, session_id: str):
+    session = _terminal_sessions(request).get(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Terminal session not found")
+    _policy_gate_or_raise(
+        request,
+        {
+            "target": session.get("target"),
+            "command": list(session.get("command") or []),
+            "scope_summary": session.get("scope_manifest") or {},
+        },
+        tool="terminal",
+        action_class="passive",
+        risk_class="passive",
+    )
+    backend = session.get("backend")
+    if backend is not None:
+        session.update(backend.metadata())
+    return JSONResponse(_sanitize_terminal_session(session))
+
+
+@router.post("/terminal/sessions/{session_id}/write")
+async def terminal_session_write(request: Request, session_id: str, payload: Dict[str, object]):
+    session = _terminal_sessions(request).get(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Terminal session not found")
+    data = str(payload.get("data") or "")
+    _policy_gate_or_raise(
+        request,
+        {
+            "target": session.get("target"),
+            "command": list(session.get("command") or []),
+            "scope_summary": session.get("scope_manifest") or {},
+        },
+        tool="terminal",
+        action_class="low_impact",
+        risk_class="low_impact",
+    )
+    backend = session.get("backend")
+    if backend is None:
+        raise HTTPException(status_code=409, detail="Terminal session backend is unavailable")
+    try:
+        result = await backend.write(data)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    session.update(backend.metadata())
+    session["updated_at"] = datetime.now(timezone.utc).isoformat()
+    session["last_action"] = "write"
+    return JSONResponse({"session": _sanitize_terminal_session(session), **result})
+
+
+@router.post("/terminal/sessions/{session_id}/read")
+async def terminal_session_read(request: Request, session_id: str, payload: Dict[str, object]):
+    session = _terminal_sessions(request).get(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Terminal session not found")
+    _policy_gate_or_raise(
+        request,
+        {
+            "target": session.get("target"),
+            "command": list(session.get("command") or []),
+            "scope_summary": session.get("scope_manifest") or {},
+        },
+        tool="terminal",
+        action_class="passive",
+        risk_class="passive",
+    )
+    backend = session.get("backend")
+    if backend is None:
+        raise HTTPException(status_code=409, detail="Terminal session backend is unavailable")
+    try:
+        result = await backend.read(
+            max_bytes=_clamp_int(payload.get("max_bytes"), 1, 65536, 8192),
+            timeout_ms=_clamp_int(payload.get("timeout_ms"), 0, 5000, 50),
+        )
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    session.update(backend.metadata())
+    session["updated_at"] = datetime.now(timezone.utc).isoformat()
+    session["last_action"] = "read"
+    return JSONResponse({"session": _sanitize_terminal_session(session), **result})
+
+
+@router.post("/terminal/sessions/{session_id}/resize")
+async def terminal_session_resize(request: Request, session_id: str, payload: Dict[str, object]):
+    session = _terminal_sessions(request).get(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Terminal session not found")
+    _policy_gate_or_raise(
+        request,
+        {
+            "target": session.get("target"),
+            "command": list(session.get("command") or []),
+            "scope_summary": session.get("scope_manifest") or {},
+        },
+        tool="terminal",
+        action_class="low_impact",
+        risk_class="low_impact",
+    )
+    backend = session.get("backend")
+    if backend is None:
+        raise HTTPException(status_code=409, detail="Terminal session backend is unavailable")
+    try:
+        result = await backend.resize(
+            cols=_clamp_int(payload.get("cols"), 40, 400, 120),
+            rows=_clamp_int(payload.get("rows"), 10, 200, 36),
+        )
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    session.update(backend.metadata())
+    session["updated_at"] = datetime.now(timezone.utc).isoformat()
+    session["last_action"] = "resize"
+    return JSONResponse({"session": _sanitize_terminal_session(session), **result})
+
+
+@router.delete("/terminal/sessions/{session_id}")
+async def delete_terminal_session(request: Request, session_id: str):
+    session = _terminal_sessions(request).pop(session_id, None)
+    if not session:
+        raise HTTPException(status_code=404, detail="Terminal session not found")
+    _policy_gate_or_raise(
+        request,
+        {
+            "target": session.get("target"),
+            "command": list(session.get("command") or []),
+            "scope_summary": session.get("scope_manifest") or {},
+        },
+        tool="terminal",
+        action_class="low_impact",
+        risk_class="low_impact",
+    )
+    backend = session.get("backend")
+    payload = {"session_id": session_id, "status": "deleted"}
+    if backend is not None:
+        payload = await backend.close()
+    return JSONResponse(payload)
 
 
 @router.post("/shannon/tasks")
@@ -926,7 +1475,7 @@ async def create_run(request: Request, payload: Dict[str, object]):
         raise HTTPException(status_code=400, detail="Live confirmation required")
     max_workers = _clamp_int(payload.get("max_workers"), 1, 8, 2)
     rate_limit_rps = _clamp_int(payload.get("rate_limit_rps"), 1, 50, 10)
-    per_task_timeout_s = _clamp_int(payload.get("per_task_timeout_s"), 5, 1200, 1200)
+    per_task_timeout_s = _clamp_int(payload.get("per_task_timeout_s"), 5, 7200, 3600)
     program_name = payload.get("program_name")
     policy = SafetyPolicy(
         allow_external_execution=live,
@@ -964,7 +1513,18 @@ async def create_run(request: Request, payload: Dict[str, object]):
 
     def _run_job():
         request.app.state.runs[job.job_id]["status"] = "running"
-        run_id, artifacts_dir = orchestrator.start_run(job.job_id, cancel_event=cancel_event)
+
+        def _on_run_id_known(actual_run_id: str, actual_artifacts_dir) -> None:
+            request.app.state.runs[job.job_id].update({
+                "run_id": actual_run_id,
+                "artifacts_dir": str(actual_artifacts_dir),
+            })
+
+        run_id, artifacts_dir = orchestrator.start_run(
+            job.job_id,
+            cancel_event=cancel_event,
+            on_run_id_known=_on_run_id_known,
+        )
         status = "completed"
         if cancel_event.is_set():
             status = "cancelled"

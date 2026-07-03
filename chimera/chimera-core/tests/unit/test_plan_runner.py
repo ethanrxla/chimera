@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 
 import httpx
@@ -71,8 +72,10 @@ def test_plan_runner_stop_on_fail(tmp_path: Path):
     runner = PlanRunner(runtime=runtime, max_workers=2, stop_on_fail=True, fixture_registry=fixtures)
     results = runner.execute(plan)
 
-    assert len(results) == 1
-    assert results[0].status == "failed"
+    result_map = {r.task_id: r for r in results}
+    assert result_map["A"].status == "failed"
+    # B was never executed — it must appear as blocked, not silently absent
+    assert result_map["B"].status == "blocked"
 
 
 def test_plan_runner_executes_routed_recon_tool(tmp_path: Path):
@@ -91,6 +94,79 @@ def test_plan_runner_executes_routed_recon_tool(tmp_path: Path):
     assert len(results) == 1
     assert results[0].status == "completed"
     assert results[0].artifacts
+
+
+def test_plan_runner_executes_zap_adapter(tmp_path: Path):
+    plan = ExecutionPlan()
+    fixture = tmp_path / "zap.json"
+    fixture.write_text(
+        """
+        {
+          "target": "https://www.example.com",
+          "alerts": [
+            {
+              "pluginid": "40012",
+              "name": "Cross Site Scripting (Reflected)",
+              "risk": "High",
+              "confidence": "Medium",
+              "url": "https://www.example.com/search?q=test",
+              "param": "q",
+              "description": "Reflected XSS detected."
+            }
+          ]
+        }
+        """,
+        encoding="utf-8",
+    )
+    plan.add_task(Task("ZAP1", "zap", "https://www.example.com", {"live": False}))
+
+    runtime = make_runtime(tmp_path)
+    runner = PlanRunner(runtime=runtime, max_workers=1, stop_on_fail=True, fixture_registry={"zap": str(fixture)})
+    results = runner.execute(plan)
+
+    assert len(results) == 1
+    assert results[0].status == "completed"
+    assert results[0].findings[0].tool_source == "zap"
+    assert any(artifact["artifact_type"] == "report" for artifact in results[0].artifacts)
+
+
+def test_plan_runner_executes_hexstrike_adapter(tmp_path: Path):
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "endpoint": "https://www.example.com/login",
+                "headers": {},
+                "checks": {"x_frame_options": False, "content_security_policy": False},
+            },
+            request=request,
+        )
+
+    transport = httpx.MockTransport(handler)
+    plan = ExecutionPlan()
+    plan.add_task(
+        Task(
+            "HX1",
+            "hexstrike",
+            "https://www.example.com/login",
+            {
+                "tool_name": "probe",
+                "agent": "deterministic_runner",
+                "transport": transport,
+            },
+        )
+    )
+
+    runtime = make_runtime(tmp_path)
+    runner = PlanRunner(runtime=runtime, max_workers=1, stop_on_fail=True)
+    results = runner.execute(plan)
+
+    assert len(results) == 1
+    assert results[0].status == "completed"
+    assert results[0].findings
+    assert results[0].findings[0].tool_source == "hexstrike"
+    artifact_types = {artifact["artifact_type"] for artifact in results[0].artifacts}
+    assert {"request", "response", "normalized", "findings"} <= artifact_types
 
 
 def test_plan_runner_executes_validator_and_writes_artifact(tmp_path: Path):
@@ -122,6 +198,94 @@ def test_plan_runner_executes_validator_and_writes_artifact(tmp_path: Path):
     assert results[0].status == "completed"
     assert results[0].findings[0].validation_status == "confirmed"
     assert results[0].artifacts
+
+
+def test_plan_runner_recovers_shannon_candidates_from_raw_output(tmp_path: Path, monkeypatch) -> None:
+    class RawOnlyShannonAdapter:
+        def run(self, targets):
+            return {
+                "findings": [],
+                "artifacts": [],
+                "raw_output_refs": [
+                    json.dumps(
+                        {
+                            "status": "completed",
+                            "agent": {
+                                "new_candidates": [
+                                    {
+                                        "candidate_id": "cand-raw-1",
+                                        "source": "shannon-agent",
+                                        "title": "Recovered open redirect",
+                                        "claim_type": "open_redirect",
+                                        "severity_claimed": "medium",
+                                        "target": "https://www.example.com",
+                                        "endpoint": "/login",
+                                        "params": ["redirect"],
+                                        "evidence_refs": ["artifact://tool-call.json"],
+                                        "metadata": {
+                                            "target": {
+                                                "method": "GET",
+                                                "endpoint": "/login",
+                                                "params": {"redirect": "https://attacker.example"},
+                                            }
+                                        },
+                                    }
+                                ]
+                            },
+                        }
+                    )
+                ],
+            }
+
+    plan = ExecutionPlan()
+    plan.add_task(
+        Task(
+            "S1",
+            "shannon",
+            "https://www.example.com",
+            {"shannon_runtime": "autonomous", "live": False, "intent": "Investigate redirects"},
+        )
+    )
+
+    runtime = make_runtime(tmp_path)
+    runner = PlanRunner(runtime=runtime, max_workers=1, stop_on_fail=True)
+    captured: dict[str, object] = {}
+
+    monkeypatch.setattr(runner, "_adapter_for_task", lambda task: RawOnlyShannonAdapter())
+
+    def fake_process(task, candidates):
+        captured["task_id"] = task.task_id
+        captured["candidates"] = candidates
+        return [], []
+
+    monkeypatch.setattr(runner, "_process_candidate_findings", fake_process)
+
+    results = runner.execute(plan)
+
+    assert results[0].status == "completed"
+    assert captured["task_id"] == "S1"
+    recovered = captured["candidates"]
+    assert len(recovered) == 1
+    assert recovered[0].claim_type == "open_redirect"
+    assert recovered[0].endpoint == "/login"
+
+
+def test_plan_runner_treats_autonomous_shannon_exploit_as_agent_runtime(tmp_path: Path) -> None:
+    runtime = make_runtime(tmp_path)
+    runner = PlanRunner(runtime=runtime, max_workers=1, stop_on_fail=True)
+    task = Task(
+        "S2",
+        "shannon",
+        "https://www.example.com",
+        {
+            "shannon_runtime": "autonomous",
+            "agent_role": "exploit",
+            "analysis_domain": "xss",
+            "live": False,
+        },
+    )
+
+    assert runner._skip_reason_for_task(task) is None
 
 
 def test_plan_runner_passes_recon_bundle_into_decepticon(tmp_path: Path):
@@ -162,8 +326,18 @@ def test_plan_runner_synthesizes_chain_from_validated_findings(tmp_path: Path):
         encoding="utf-8",
     )
 
+    async def bola_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"id": 7, "email": "victim@example.com"}, request=request)
+
+    bola_transport = httpx.MockTransport(bola_handler)
+
     plan = ExecutionPlan()
-    plan.add_task(Task("S1", "shannon", "https://api.example.com/users/7", {"live": False}))
+    # http_transport is inherited by the auto-injected bola_validator so it can
+    # make mock HTTP calls instead of hitting a real server.
+    plan.add_task(Task("S1", "shannon", "https://api.example.com/users/7", {
+        "live": False,
+        "http_transport": bola_transport,
+    }))
     plan.add_task(
         Task(
             "J1",
@@ -188,3 +362,95 @@ def test_plan_runner_synthesizes_chain_from_validated_findings(tmp_path: Path):
     artifact_types = {artifact["artifact_type"] for artifact in chain_results[0].artifacts}
     assert "chain_replay_manifest" in artifact_types
     assert "poc_bundle" in artifact_types
+
+
+def test_plan_runner_skips_shannon_exploit_phase_when_analysis_queue_is_empty(tmp_path: Path):
+    plan = ExecutionPlan()
+    plan.add_task(
+        Task(
+            "S-ANALYZE",
+            "shannon",
+            "https://www.example.com",
+            {
+                "live": False,
+                "raw_output_override": "{\"findings\": []}",
+                "agent_role": "analysis",
+                "analysis_domain": "xss",
+            },
+            stage="vulnerability_analysis",
+        )
+    )
+    plan.add_task(
+        Task(
+            "S-EXPLOIT",
+            "shannon",
+            "https://www.example.com",
+            {
+                "live": False,
+                "raw_output_override": "{\"findings\": [{\"title\": \"should not run\", \"severity\": \"high\", \"target\": \"https://www.example.com\"}]}",
+                "agent_role": "exploit",
+                "analysis_domain": "xss",
+            },
+            stage="exploitation",
+        )
+    )
+    plan.add_dependency("S-ANALYZE", "S-EXPLOIT")
+
+    runtime = make_runtime(tmp_path)
+    runner = PlanRunner(runtime=runtime, max_workers=1, stop_on_fail=True)
+    results = runner.execute(plan)
+
+    result_map = {result.task_id: result for result in results}
+    assert result_map["S-ANALYZE"].status == "completed"
+    assert result_map["S-EXPLOIT"].status == "skipped"
+
+
+def test_independent_chain_continues_after_failure(tmp_path: Path):
+    """A failing task should only block its own dependents, not independent chains."""
+    # Chain 1: A (fails, out-of-scope) → B (should be blocked)
+    # Chain 2: C (independent, should complete normally)
+    fixtures_dir = Path(__file__).resolve().parents[1] / "fixtures" / "autoswagger"
+    fixtures = {"autoswagger": str(fixtures_dir / "output.json")}
+
+    plan = ExecutionPlan()
+    plan.add_task(Task("A", "autoswagger", "https://evil.com", {"live": False}))
+    plan.add_task(Task("B", "autoswagger", "https://api.example.com/api", {"live": False}))
+    plan.add_task(Task("C", "autoswagger", "https://api.example.com/api", {"live": False}))
+    plan.add_dependency("A", "B")
+    # C has no dependency on A or B — independent chain
+
+    runtime = make_runtime(tmp_path)
+    runner = PlanRunner(runtime=runtime, max_workers=3, stop_on_fail=True, fixture_registry=fixtures)
+    results = runner.execute(plan)
+
+    result_map = {r.task_id: r for r in results}
+    assert result_map["A"].status == "failed"
+    assert result_map["B"].status == "blocked"
+    # C is independent — must complete even though A failed
+    assert result_map["C"].status == "completed"
+
+
+def test_only_dependents_blocked_not_siblings(tmp_path: Path):
+    """task_blocked must only fire for A's subtree, not for sibling chains."""
+    fixtures_dir = Path(__file__).resolve().parents[1] / "fixtures" / "autoswagger"
+    fixtures = {"autoswagger": str(fixtures_dir / "output.json")}
+
+    plan = ExecutionPlan()
+    # A fails → B blocked
+    plan.add_task(Task("A", "autoswagger", "https://evil.com", {"live": False}))
+    plan.add_task(Task("B", "autoswagger", "https://api.example.com/api", {"live": False}))
+    plan.add_dependency("A", "B")
+    # D and E are siblings — independent of A/B
+    plan.add_task(Task("D", "autoswagger", "https://api.example.com/api", {"live": False}))
+    plan.add_task(Task("E", "autoswagger", "https://api.example.com/api", {"live": False}))
+    plan.add_dependency("D", "E")
+
+    runtime = make_runtime(tmp_path)
+    runner = PlanRunner(runtime=runtime, max_workers=4, stop_on_fail=True, fixture_registry=fixtures)
+    results = runner.execute(plan)
+
+    result_map = {r.task_id: r for r in results}
+    assert result_map["A"].status == "failed"
+    assert result_map["B"].status == "blocked"
+    assert result_map["D"].status == "completed"
+    assert result_map["E"].status == "completed"

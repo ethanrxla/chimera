@@ -1,4 +1,4 @@
-use crate::models::{default_api_base, CliState};
+use crate::models::{default_api_base, default_ollama_base, CliState};
 use anyhow::{Context, Result};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -18,17 +18,20 @@ pub fn load_state() -> CliState {
     if !path.exists() {
         return CliState {
             api_base: default_api_base(),
+            ollama_base: default_ollama_base(),
             ..CliState::default()
         };
     }
     let Ok(contents) = fs::read_to_string(path) else {
         return CliState {
             api_base: default_api_base(),
+            ollama_base: default_ollama_base(),
             ..CliState::default()
         };
     };
     serde_json::from_str(&contents).unwrap_or(CliState {
         api_base: default_api_base(),
+        ollama_base: default_ollama_base(),
         ..CliState::default()
     })
 }

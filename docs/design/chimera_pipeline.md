@@ -47,8 +47,8 @@ This stage generates an `ExecutionPlan` (`chimera_core.planner` module) — a Di
 *   **Process:**
     *   **Planner Logic:** Uses capability-based routing. For example:
         *   If OpenAPI/Swagger is detected or explicitly in scope, schedule `Autoswagger` tasks.
-        *   If a general web application is in scope, schedule `Strix` tasks.
-        *   If high-confidence validation (exploitation) is allowed, schedule `Shannon` tasks.
+        *   If a general web application is in scope, schedule `Strix` tasks. Strix has access to 19 HexStrike tool wrappers (nmap, nuclei, gobuster, sqlmap, dalfox, ffuf, katana, subfinder, httpx, nikto, …) and calls them directly during its agentic loop.
+        *   Shannon tasks are scheduled after Strix. Shannon's executor stage has a live tool-call loop: it emits `<hexstrike_call>{"tool":"<name>","target":"<url>"}` blocks, the Shannon service dispatches them to HexStrike (port 8888), injects results back into the LLM context, and iterates up to `HEXSTRIKE_MAX_TOOL_TURNS` times (default 3) before producing findings.
     *   **DAG Construction:** Tasks are defined with dependencies, forming a DAG (Adjacency List + Indegree Map).
 *   **Output:** `ExecutionPlan` (a DAG of `Task` objects).
 
@@ -69,7 +69,9 @@ The `Runner` (`chimera_core.runner` module) executes the `ExecutionPlan` safely,
     *   **Rate Limiting (Future):** Employs a Token Bucket algorithm per-host to enforce `max_rps` from `ScopePolicy`.
     *   **Circuit Breaker (Future):** Implements logic to temporarily stop hammering hosts that are erroring excessively.
     *   **Tool Adapter Invocation:** Calls the `run()` method of the selected tool adapters.
-    *   **Event Emission:** Emits structured events (`task_started`, `task_finished`, `finding_emitted`, `artifact_saved`) to the `event_sink` for real-time tracking and auditability.
+    *   **Partial-success handling:** If Strix exits non-zero but produced a `run.completed` event in `events.jsonl` or data rows in `vulnerabilities.csv`, the adapter treats it as `partial_success` rather than a hard failure. Only that task's downstream dependents are blocked; independent chains (browser, Shannon) continue.
+    *   **Per-chain failure isolation:** On hard failure, only the failed task's transitive dependents are added to `blocked_chains`. Independent task chains are not halted.
+    *   **Event Emission:** Emits structured events (`task_started`, `task_finished`, `finding_emitted`, `artifact_saved`, `task_warning`, `task_blocked`) to the `event_sink` for real-time tracking and auditability.
 *   **Output:** Raw artifacts (tool outputs), structured event stream.
 
 ### 6. Results Analysis
@@ -79,8 +81,11 @@ This stage (`chimera_core.orchestrator` in collaboration with adapters) transfor
 *   **Input:** Raw tool output from adapters.
 *   **Process:**
     *   **Normalization Pipeline:** Each tool adapter's `normalize()` method (part of the formal adapter contract) parses its raw output into the unified `Finding` schema.
-    *   **Deduplication:** Uses the `FindingDedupeIndex` in `RunContext` to prevent reporting identical findings across different tools or runs (key = `hash(vuln_type + target + key_evidence)`).
-    *   **Triage (Future):** Prioritizes findings by severity, confidence, or impact (e.g., using a Priority Queue/Max-Heap).
+    *   **Strix finding deduplication:** The strix adapter merges findings whose titles share >50% Jaccard word overlap at the same severity+URL, keeping the richer description and unioning evidence refs.
+    *   **Contradiction detection:** If `penetration_test_report.md` summary contradicts a finding (e.g. "robust against clickjacking" but a clickjacking vuln exists), the finding's confidence is downgraded to 0.3 and a `contradiction_note` is attached.
+    *   **Shannon LLM oracle (stage after Strix):** Three-stage chain — planner (`qwen2.5-coder:7b`) drafts hypotheses, executor (`whiterabbitneo-13b`) calls HexStrike tools live to gather evidence (up to 3 tool turns), validator (`qwen2.5-coder:7b`) produces a final JSON findings array.
+    *   **Global deduplication:** Uses the `FindingDedupeIndex` in `RunContext` to prevent reporting identical findings across different tools or runs.
+    *   **Triage (Future):** Prioritizes findings by severity, confidence, or impact.
 *   **Output:** Normalized `Finding` objects (stored in `Job.findings`), and suggested `next_actions` (future).
 
 ---

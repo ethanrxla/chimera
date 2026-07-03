@@ -220,4 +220,13 @@ __marimo__/
 PAT
 kali_data/
 .claude/
+.codex
+.codex/
+bounties/
+bunny_photos/
+debug/
+screenshots/
+f015_algnone_poc_output.txt
+/main.js
+scope_*.yml
 docker-compose.yml.bak
