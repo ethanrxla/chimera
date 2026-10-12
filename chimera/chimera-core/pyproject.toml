@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "chimera-core"
+version = "0.1.0"
+description = "Chimera core API and recon runtime"
+requires-python = ">=3.11"
+# Dependencies are installed from requirements.txt in the image (the single
+# source of truth), so they are intentionally omitted here. This metadata
+# exists only to make chimera_core importable regardless of cwd, PYTHONPATH,
+# or a bind mount shadowing /app/chimera-core.
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["chimera_core*"]
