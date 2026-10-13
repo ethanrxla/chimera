@@ -105,9 +105,12 @@ RUN if [ "$ENABLE_SECURITY" = "1" ]; then \
 
 COPY chimera/chimera-core /app/chimera-core
 
-# Install chimera_core as an editable package so it is importable regardless of
-# cwd, PYTHONPATH, or a bind mount shadowing /app/chimera-core. Deps come from
-# requirements.txt above, so --no-deps keeps that the single source of truth.
-# The egg-link points at /app/chimera-core, which the compose bind mount
-# replaces at runtime with the live source, so edits still take effect.
-RUN pip3 install --no-cache-dir --no-deps -e /app/chimera-core
+# Bake chimera_core into site-packages (a real, non-editable install) so it is
+# importable even if the compose bind mount for /app/chimera-core resolves to an
+# empty/partial directory inside the container -- a common Docker Desktop (WSL)
+# file-sharing failure that otherwise shadows the package and crash-loops the
+# API with ModuleNotFoundError. When the mount is healthy, the compose command's
+# `cd chimera-core` + PYTHONPATH put the live source first on sys.path, so edits
+# still take effect; the baked copy is the fallback, not a replacement.
+# --no-deps keeps requirements.txt (installed above) the single dependency source.
+RUN pip3 install --no-cache-dir --no-deps /app/chimera-core
